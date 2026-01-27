@@ -2,15 +2,17 @@ package monitor
 
 import (
 	"archefriend/config"
+	"archefriend/input"
 	"archefriend/memory"
+	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-// BuffInfo representa informações de um buff
 type BuffInfo struct {
 	Index    int
 	ID       uint32
@@ -20,7 +22,6 @@ type BuffInfo struct {
 	Name     string
 }
 
-// DebuffInfo representa informações de um debuff
 type DebuffInfo struct {
 	Index   int
 	ID      uint32
@@ -30,7 +31,6 @@ type DebuffInfo struct {
 	CCName  string
 }
 
-// BuffEvent representa um evento de buff/debuff
 type BuffEvent struct {
 	Time      time.Time
 	Action    string // "+" ou "-"
@@ -39,45 +39,268 @@ type BuffEvent struct {
 	Reacted   bool
 }
 
-// BuffMonitor monitora buffs do player
-type BuffMonitor struct {
-	handle        windows.Handle
-	x2game        uintptr
-	Enabled       bool
-	BuffListAddr  uintptr
-	Buffs         []BuffInfo
-	Events        []BuffEvent
-	KnownIDs      map[uint32]bool
-	RawCount      uint32
 
-	// Callbacks
+type BuffWhitelistEntry struct {
+	Type     uint32         `json:"type"`
+	Name     string         `json:"name"`
+	Use      string         `json:"use"`
+	KeyCombo input.KeyCombo `json:"-"`
+}
+
+type BuffWhitelist struct {
+	Entries      []BuffWhitelistEntry
+	TypeMap      map[uint32]*BuffWhitelistEntry
+	Enabled      bool
+	Reactions    int
+	SpamCount    int
+	SpamInterval time.Duration
+	lastSpamTime time.Time
+	spamCooldown time.Duration
+}
+
+func NewBuffWhitelist() *BuffWhitelist {
+	wl := &BuffWhitelist{
+		Entries:      make([]BuffWhitelistEntry, 0),
+		TypeMap:      make(map[uint32]*BuffWhitelistEntry),
+		Enabled:      true,
+		SpamCount:    config.KEY_SPAM_COUNT,
+		SpamInterval: config.KEY_SPAM_INTERVAL,
+		spamCooldown: 100 * time.Millisecond,
+	}
+	wl.LoadFromFile("buff_whitelist.json")
+	return wl
+}
+
+func (wl *BuffWhitelist) LoadFromFile(filename string) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		wl.createDefaultFile(filename)
+		return
+	}
+
+	var entries []BuffWhitelistEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return
+	}
+
+	wl.Entries = entries
+	wl.TypeMap = make(map[uint32]*BuffWhitelistEntry)
+
+	for i := range wl.Entries {
+		wl.Entries[i].KeyCombo = input.ParseKeyCombo(wl.Entries[i].Use)
+		if wl.Entries[i].KeyCombo.MainKey != 0 {
+			wl.TypeMap[wl.Entries[i].Type] = &wl.Entries[i]
+		}
+	}
+}
+
+func (wl *BuffWhitelist) createDefaultFile(filename string) {
+	defaultEntries := []BuffWhitelistEntry{
+		{Type: 87, Name: "Hell Spear", Use: "F10"},
+		{Type: 243, Name: "stun", Use: "SHIFT+1"},
+		{Type: 156, Name: "Fear", Use: "CTRL+2"},
+		{Type: 21402, Name: "Deafened", Use: "ALT+F1"},
+		{Type: 8000210, Name: "Clash Dummy", Use: "SHIFT+5"},
+		{Type: 21, Name: "Tripped (Strong)", Use: "CTRL+SHIFT+1"},
+		{Type: 141, Name: "Tripped", Use: "9"},
+		{Type: 6860, Name: "Impaled", Use: "SHIFT+F10"},
+		{Type: 18396, Name: "Skewer", Use: "F10"},
+		{Type: 2458, Name: "Snare (charge)", Use: "F11"},
+		{Type: 6829, Name: "Throw Dagger", Use: "CTRL+F11"},
+		{Type: 501, Name: "Shield Slam", Use: "F10"},
+		{Type: 3601, Name: "Overrun", Use: "SHIFT+F12"},
+	}
+
+	data, _ := json.MarshalIndent(defaultEntries, "", "  ")
+	os.WriteFile(filename, data, 0644)
+
+	wl.Entries = defaultEntries
+	wl.TypeMap = make(map[uint32]*BuffWhitelistEntry)
+	for i := range wl.Entries {
+		wl.Entries[i].KeyCombo = input.ParseKeyCombo(wl.Entries[i].Use)
+		if wl.Entries[i].KeyCombo.MainKey != 0 {
+			wl.TypeMap[wl.Entries[i].Type] = &wl.Entries[i]
+		}
+	}
+}
+
+func (wl *BuffWhitelist) ReactInstant(buffID uint32) (bool, string) {
+	if !wl.Enabled {
+		return false, ""
+	}
+
+	entry, exists := wl.TypeMap[buffID]
+	if !exists {
+		return false, ""
+	}
+
+	if time.Since(wl.lastSpamTime) < wl.spamCooldown {
+		return false, ""
+	}
+
+	wl.lastSpamTime = time.Now()
+	go input.SpamKey(entry.KeyCombo.RawString, wl.SpamCount, wl.SpamInterval)
+
+	wl.Reactions++
+	return true, entry.Name
+}
+
+func (wl *BuffWhitelist) GetName(buffID uint32) string {
+	if entry, exists := wl.TypeMap[buffID]; exists {
+		return entry.Name
+	}
+	return ""
+}
+
+
+type CCWhitelistEntry struct {
+	Type     uint32         `json:"type"`
+	Name     string         `json:"name"`
+	Use      string         `json:"use"`
+	KeyCombo input.KeyCombo `json:"-"`
+}
+
+type CCWhitelist struct {
+	Entries      []CCWhitelistEntry
+	TypeMap      map[uint32]*CCWhitelistEntry
+	Enabled      bool
+	Reactions    int
+	SpamCount    int
+	SpamInterval time.Duration
+	lastSpamTime time.Time
+	spamCooldown time.Duration
+}
+
+func NewCCWhitelist() *CCWhitelist {
+	wl := &CCWhitelist{
+		Entries:      make([]CCWhitelistEntry, 0),
+		TypeMap:      make(map[uint32]*CCWhitelistEntry),
+		Enabled:      true,
+		SpamCount:    config.KEY_SPAM_COUNT,
+		SpamInterval: config.KEY_SPAM_INTERVAL,
+		spamCooldown: 100 * time.Millisecond,
+	}
+	wl.LoadFromFile("cc_whitelist.json")
+	return wl
+}
+
+func (wl *CCWhitelist) LoadFromFile(filename string) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		wl.createDefaultFile(filename)
+		return
+	}
+
+	var entries []CCWhitelistEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return
+	}
+
+	wl.Entries = entries
+	wl.TypeMap = make(map[uint32]*CCWhitelistEntry)
+
+	for i := range wl.Entries {
+		wl.Entries[i].KeyCombo = input.ParseKeyCombo(wl.Entries[i].Use)
+		if wl.Entries[i].KeyCombo.MainKey != 0 {
+			wl.TypeMap[wl.Entries[i].Type] = &wl.Entries[i]
+		}
+	}
+}
+
+func (wl *CCWhitelist) createDefaultFile(filename string) {
+	defaultEntries := []CCWhitelistEntry{
+		{Type: 3601, Name: "stun", Use: "F12"},
+		{Type: 509, Name: "knockdown", Use: "SHIFT+F12"},
+		{Type: 4622, Name: "sleep", Use: "CTRL+F11"},
+		{Type: 6800, Name: "fear", Use: "F12"},
+		{Type: 20121, Name: "silence", Use: "SHIFT+1"},
+		{Type: 22290, Name: "root", Use: "CTRL+2"},
+	}
+
+	data, _ := json.MarshalIndent(defaultEntries, "", "  ")
+	os.WriteFile(filename, data, 0644)
+
+	wl.Entries = defaultEntries
+	wl.TypeMap = make(map[uint32]*CCWhitelistEntry)
+	for i := range wl.Entries {
+		wl.Entries[i].KeyCombo = input.ParseKeyCombo(wl.Entries[i].Use)
+		if wl.Entries[i].KeyCombo.MainKey != 0 {
+			wl.TypeMap[wl.Entries[i].Type] = &wl.Entries[i]
+		}
+	}
+}
+
+func (wl *CCWhitelist) ReactInstant(typeID uint32) (bool, string) {
+	if !wl.Enabled {
+		return false, ""
+	}
+	entry, exists := wl.TypeMap[typeID]
+	if !exists {
+		return false, ""
+	}
+
+	if time.Since(wl.lastSpamTime) < wl.spamCooldown {
+		return false, ""
+	}
+
+	wl.lastSpamTime = time.Now()
+	go input.SpamKey(entry.KeyCombo.RawString, wl.SpamCount, wl.SpamInterval)
+
+	wl.Reactions++
+	return true, entry.Name
+}
+
+func (wl *CCWhitelist) GetName(typeID uint32) string {
+	if entry, exists := wl.TypeMap[typeID]; exists {
+		return entry.Name
+	}
+	return ""
+}
+
+type ReactionHandler interface {
+	OnBuffGained(buffID uint32)
+	OnBuffLost(buffID uint32)
+	OnDebuffGained(debuffID uint32)
+	OnDebuffLost(debuffID uint32)
+	IsEnabled() bool
+}
+
+type BuffMonitor struct {
+	handle          windows.Handle
+	x2game          uintptr
+	Enabled         bool
+	BuffListAddr    uintptr
+	Buffs           []BuffInfo
+	Events          []BuffEvent
+	KnownIDs        map[uint32]bool
+	RawCount        uint32
+	Whitelist       *BuffWhitelist
+	ReactionHandler ReactionHandler
+
 	OnBuffGained func(buff BuffInfo)
 	OnBuffLost   func(buffID uint32)
 
-	// Buffers
 	buffBuffer []byte
 }
 
-// DebuffMonitor monitora debuffs do player
 type DebuffMonitor struct {
-	handle      windows.Handle
-	x2game      uintptr
-	Enabled     bool
-	DebuffBase  uintptr
-	Debuffs     []DebuffInfo
-	Events      []BuffEvent
-	KnownIDs    map[uint64]bool
-	RawCount    uint32
+	handle          windows.Handle
+	x2game          uintptr
+	Enabled         bool
+	DebuffBase      uintptr
+	Debuffs         []DebuffInfo
+	Events          []BuffEvent
+	KnownIDs        map[uint64]bool
+	RawCount        uint32
+	CCWhitelist     *CCWhitelist
+	ReactionHandler ReactionHandler
 
-	// Callbacks
 	OnDebuffGained func(debuff DebuffInfo)
 	OnDebuffLost   func(debuffID uint32)
 
-	// Buffers
 	debuffBuffer []byte
 }
 
-// NewBuffMonitor cria um novo monitor de buffs
 func NewBuffMonitor(handle windows.Handle, x2game uintptr) *BuffMonitor {
 	return &BuffMonitor{
 		handle:     handle,
@@ -86,10 +309,14 @@ func NewBuffMonitor(handle windows.Handle, x2game uintptr) *BuffMonitor {
 		KnownIDs:   make(map[uint32]bool),
 		Events:     make([]BuffEvent, 0, 100),
 		buffBuffer: make([]byte, 30*config.BUFF_SIZE),
+		Whitelist:  NewBuffWhitelist(),
 	}
 }
 
-// NewDebuffMonitor cria um novo monitor de debuffs
+func (m *BuffMonitor) SetReactionHandler(handler ReactionHandler) {
+	m.ReactionHandler = handler
+}
+
 func NewDebuffMonitor(handle windows.Handle, x2game uintptr) *DebuffMonitor {
 	return &DebuffMonitor{
 		handle:       handle,
@@ -98,15 +325,18 @@ func NewDebuffMonitor(handle windows.Handle, x2game uintptr) *DebuffMonitor {
 		KnownIDs:     make(map[uint64]bool),
 		Events:       make([]BuffEvent, 0, 100),
 		debuffBuffer: make([]byte, 30*config.DEBUFF_SIZE),
+		CCWhitelist:  NewCCWhitelist(),
 	}
 }
 
-// MakeKey cria uma chave única para debuff (ID + TypeID)
+func (m *DebuffMonitor) SetReactionHandler(handler ReactionHandler) {
+	m.ReactionHandler = handler
+}
+
 func MakeKey(id, typeID uint32) uint64 {
 	return uint64(id)<<32 | uint64(typeID)
 }
 
-// GetBuffListAddr obtém o endereço da lista de buffs
 func (m *BuffMonitor) GetBuffListAddr(playerAddr uint32) uintptr {
 	base := memory.ReadU32(m.handle, uintptr(playerAddr)+uintptr(config.OFF_ENTITY_BASE))
 	if !memory.IsValidPtr(base) {
@@ -119,7 +349,6 @@ func (m *BuffMonitor) GetBuffListAddr(playerAddr uint32) uintptr {
 	return uintptr(listPtr)
 }
 
-// Update atualiza os buffs do player
 func (m *BuffMonitor) Update(playerAddr uint32) {
 	if !m.Enabled || playerAddr == 0 {
 		return
@@ -134,7 +363,6 @@ func (m *BuffMonitor) Update(playerAddr uint32) {
 	m.RawCount = count
 
 	if count == 0 || count > 50 {
-		// Notificar sobre todos os buffs perdidos
 		for buffID := range m.KnownIDs {
 			if m.OnBuffLost != nil {
 				m.OnBuffLost(buffID)
@@ -193,10 +421,22 @@ func (m *BuffMonitor) Update(playerAddr uint32) {
 			Stack:    stack,
 		}
 
-		// Detectar novo buff
 		if !m.KnownIDs[buffID] {
 			m.KnownIDs[buffID] = true
-			m.AddEvent("+", buffID, buff.Name, false)
+
+			reacted := false
+			if m.Whitelist != nil {
+				if ok, name := m.Whitelist.ReactInstant(buffID); ok {
+					reacted = true
+					buff.Name = name
+				}
+			}
+
+			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
+				m.ReactionHandler.OnBuffGained(buffID)
+			}
+
+			m.AddEvent("+", buffID, buff.Name, reacted)
 			if m.OnBuffGained != nil {
 				m.OnBuffGained(buff)
 			}
@@ -205,10 +445,14 @@ func (m *BuffMonitor) Update(playerAddr uint32) {
 		newBuffs = append(newBuffs, buff)
 	}
 
-	// Detectar buffs perdidos
 	for id := range m.KnownIDs {
 		if !currentIDs[id] {
 			delete(m.KnownIDs, id)
+
+			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
+				m.ReactionHandler.OnBuffLost(id)
+			}
+
 			m.AddEvent("-", id, "", false)
 			if m.OnBuffLost != nil {
 				m.OnBuffLost(id)
@@ -219,7 +463,6 @@ func (m *BuffMonitor) Update(playerAddr uint32) {
 	m.Buffs = newBuffs
 }
 
-// AddEvent adiciona um evento ao histórico
 func (m *BuffMonitor) AddEvent(action string, id uint32, name string, reacted bool) {
 	event := BuffEvent{
 		Time:    time.Now(),
@@ -234,7 +477,6 @@ func (m *BuffMonitor) AddEvent(action string, id uint32, name string, reacted bo
 	}
 }
 
-// GetDebuffBase obtém o endereço base dos debuffs
 func (m *DebuffMonitor) GetDebuffBase(playerAddr uint32) uintptr {
 	base := memory.ReadU32(m.handle, uintptr(playerAddr)+uintptr(config.OFF_ENTITY_BASE))
 	if !memory.IsValidPtr(base) {
@@ -247,14 +489,8 @@ func (m *DebuffMonitor) GetDebuffBase(playerAddr uint32) uintptr {
 	return uintptr(debuffBase)
 }
 
-// Update atualiza os debuffs do player
 func (m *DebuffMonitor) Update(playerAddr uint32) {
-	if !m.Enabled {
-		return
-	}
-
-	if playerAddr == 0 {
-		// Não printa aqui pois é esperado quando não está conectado
+	if !m.Enabled || playerAddr == 0 {
 		return
 	}
 
@@ -267,11 +503,8 @@ func (m *DebuffMonitor) Update(playerAddr uint32) {
 	m.RawCount = count
 
 	if count == 0 || count > 50 {
-		// Notificar sobre todos os debuffs perdidos
 		for key := range m.KnownIDs {
-			id := uint32(key >> 32)
 			typeID := uint32(key & 0xFFFFFFFF)
-			fmt.Printf("[MONITOR] Debuff removido (count=0)! ID:%d TypeID:%d\n", id, typeID)
 			if m.OnDebuffLost != nil {
 				m.OnDebuffLost(typeID)
 			}
@@ -327,36 +560,45 @@ func (m *DebuffMonitor) Update(playerAddr uint32) {
 			DurLeft: durLeft,
 		}
 
-		// Detectar novo debuff
 		if !m.KnownIDs[key] {
 			m.KnownIDs[key] = true
-			m.AddEvent("+", id, typeID, "", false)
-			fmt.Printf("[MONITOR] Novo debuff! ID:%d TypeID:%d Key:0x%X DurMax:%d DurLeft:%d\n",
-				id, typeID, key, durMax, durLeft)
+
+			reacted := false
+			ccName := ""
+			if m.CCWhitelist != nil {
+				if ok, name := m.CCWhitelist.ReactInstant(typeID); ok {
+					reacted = true
+					ccName = name
+					debuff.CCName = name
+				}
+			}
+
+			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
+				m.ReactionHandler.OnDebuffGained(typeID)
+			}
+
+			m.AddEvent("+", id, typeID, ccName, reacted)
 			if m.OnDebuffGained != nil {
 				m.OnDebuffGained(debuff)
 			}
-		} else {
-			// Debuff já conhecido, apenas atualizando duração
-			// fmt.Printf("[MONITOR] Debuff existente TypeID:%d DurLeft:%d\n", typeID, durLeft)
 		}
 
 		newDebuffs = append(newDebuffs, debuff)
 	}
 
-	// Detectar debuffs perdidos
 	for key := range m.KnownIDs {
 		if !currentIDs[key] {
 			delete(m.KnownIDs, key)
 			id := uint32(key >> 32)
 			typeID := uint32(key & 0xFFFFFFFF)
+
+			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
+				m.ReactionHandler.OnDebuffLost(typeID)
+			}
+
 			m.AddEvent("-", id, typeID, "", false)
-			fmt.Printf("[MONITOR] Debuff removido! ID:%d TypeID:%d Key:0x%X\n", id, typeID, key)
 			if m.OnDebuffLost != nil {
-				fmt.Printf("[MONITOR] Chamando OnDebuffLost para TypeID:%d\n", typeID)
 				m.OnDebuffLost(typeID)
-			} else {
-				fmt.Printf("[MONITOR] OnDebuffLost callback é nil!\n")
 			}
 		}
 	}
@@ -364,7 +606,6 @@ func (m *DebuffMonitor) Update(playerAddr uint32) {
 	m.Debuffs = newDebuffs
 }
 
-// AddEvent adiciona um evento ao histórico
 func (m *DebuffMonitor) AddEvent(action string, id, typeID uint32, name string, reacted bool) {
 	event := BuffEvent{
 		Time:    time.Now(),
@@ -379,7 +620,6 @@ func (m *DebuffMonitor) AddEvent(action string, id, typeID uint32, name string, 
 	}
 }
 
-// HasBuff verifica se tem um buff específico
 func (m *BuffMonitor) HasBuff(buffID uint32) bool {
 	for _, b := range m.Buffs {
 		if b.ID == buffID {
@@ -389,7 +629,6 @@ func (m *BuffMonitor) HasBuff(buffID uint32) bool {
 	return false
 }
 
-// HasDebuff verifica se tem um debuff específico
 func (m *DebuffMonitor) HasDebuff(debuffID uint32) bool {
 	for _, d := range m.Debuffs {
 		if d.ID == debuffID {

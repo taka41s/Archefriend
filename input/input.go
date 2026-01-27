@@ -514,3 +514,83 @@ func (m *Manager) ToggleAutoSpam() {
 		m.StartAutoSpam()
 	}
 }
+
+// ================== KEY COMBO ==================
+
+// KeyCombo representa uma combinação de teclas parseada
+type KeyCombo struct {
+	RawString  string
+	Modifiers  []uint16
+	MainKey    uint16
+	AllKeys    []uint16
+}
+
+// ParseKeyCombo converte uma string como "SHIFT+F10" ou "CTRL+ALT+1" em KeyCombo
+func ParseKeyCombo(keyStr string) KeyCombo {
+	combo := KeyCombo{RawString: keyStr}
+
+	if keyStr == "" {
+		return combo
+	}
+
+	keys, err := ParseKeyString(strings.ToUpper(keyStr))
+	if err != nil {
+		fmt.Printf("[INPUT] Erro ao parsear combo '%s': %v\n", keyStr, err)
+		return combo
+	}
+
+	if len(keys) == 0 {
+		return combo
+	}
+
+	combo.AllKeys = keys
+
+	// Separar modificadores da tecla principal
+	for i, vk := range keys {
+		if isModifier(vk) {
+			combo.Modifiers = append(combo.Modifiers, vk)
+		} else {
+			// Última tecla não-modificadora é a principal
+			if i == len(keys)-1 {
+				combo.MainKey = vk
+			}
+		}
+	}
+
+	// Se não encontrou tecla principal, usar a última
+	if combo.MainKey == 0 && len(keys) > 0 {
+		combo.MainKey = keys[len(keys)-1]
+	}
+
+	return combo
+}
+
+// isModifier verifica se é uma tecla modificadora
+func isModifier(vk uint16) bool {
+	return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_ALT ||
+		vk == VK_LSHIFT || vk == VK_RSHIFT ||
+		vk == VK_LCONTROL || vk == VK_RCONTROL ||
+		vk == VK_LMENU || vk == VK_RMENU
+}
+
+// SpamKey envia uma combinação de teclas múltiplas vezes
+func SpamKey(keyStr string, count int, interval time.Duration) {
+	combo := ParseKeyCombo(keyStr)
+	if combo.MainKey == 0 {
+		fmt.Printf("[INPUT] SpamKey: tecla inválida '%s'\n", keyStr)
+		return
+	}
+
+	for i := 0; i < count; i++ {
+		if len(combo.Modifiers) > 0 {
+			// Com modificadores
+			SendKeyCombo(combo.AllKeys)
+		} else {
+			// Tecla simples
+			SendKey(combo.MainKey)
+		}
+		if i < count-1 {
+			time.Sleep(interval)
+		}
+	}
+}
