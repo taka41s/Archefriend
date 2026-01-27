@@ -1,0 +1,22 @@
+{
+  "overlay": {
+    "toggle_visible": "END",
+    "reload_configs": "F5",
+    "toggle_reactions": "F6"
+  },
+  "cheats": {
+    "loot_bypass": "F1",
+    "doodad_bypass": "F2",
+    "input_spam_once": "F3",
+    "input_spam_toggle": "F4"
+  },
+  "windows": {
+    "config_window": "F7",
+    "buff_window": "F8",
+    "quick_access": "F9"
+  },
+  "info": {
+    "description": "Keybinds configuration for ArcheFriend",
+    "note": "Edit this file and press F5 in-game to reload"
+  }
+}

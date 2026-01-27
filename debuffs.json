@@ -1,0 +1,67 @@
+[
+  {
+    "type": 21,
+    "name": "Tripped (Strong)",
+    "use": "F3"
+  },
+  {
+    "type": 501,
+    "name": "Shield Slam",
+    "use": "F10"
+  },
+  {
+    "type": 2458,
+    "name": "Snare (charge)",
+    "use": "F11"
+  },
+  {
+    "type": 3601,
+    "name": "Overrun",
+    "use": "F10"
+  },
+  {
+    "type": 156,
+    "name": "Fear",
+    "use": "F11"
+  },
+  {
+    "type": 449,
+    "name": "Focal concusion",
+    "use": "F10"
+  },
+  {
+    "type": 21402,
+    "name": "Deafened",
+    "use": "F11"
+  },
+  {
+    "type": 141,
+    "name": "Tripped",
+    "use": "F3"
+  },
+  {
+    "type": 243,
+    "name": "stun",
+    "use": "F10"
+  },
+  {
+    "type": 6860,
+    "name": "Impaled",
+    "use": "F10"
+  },
+  {
+    "type": 18396,
+    "name": "Skewer",
+    "use": "F10"
+  },
+  {
+    "type": 87,
+    "name": "Hell Spear",
+    "use": "F10"
+  },
+  {
+    "type": 6829,
+    "name": "Throw Dagger",
+    "use": "F11"
+  }
+]

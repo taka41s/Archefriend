@@ -1,0 +1,52 @@
+# Binários
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build folders
+archefriend-release/
+build/
+dist/
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
+
+# Go
+*.test
+*.out
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# AI/Copilot generated docs
+ARCHITECTURE_ANALYSIS.md
+BUGFIX_*.md
+HOOK_IMPLEMENTATION_GUIDE.md
+REACTIONS_EXAMPLE.md
+README_*.md
+SUMMARY.md
+TROUBLESHOOTING.md
+
+# AI assistant configs
+.github/copilot-instructions.md
+.claude/

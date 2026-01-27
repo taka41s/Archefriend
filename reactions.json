@@ -1,0 +1,146 @@
+[
+  {
+    "type": 21,
+    "name": "Tripped (Strong)",
+    "onStart": "F3",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 87,
+    "name": "Hell Spear",
+    "onStart": "F10",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 141,
+    "name": "Tripped",
+    "onStart": "F3",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 156,
+    "name": "Fear",
+    "onStart": "F11",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 243,
+    "name": "stun",
+    "onStart": "F10",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 449,
+    "name": "Focal concusion",
+    "onStart": "F10",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 501,
+    "name": "Shield Slam",
+    "onStart": "F10",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 2113,
+    "name": "Berserk !",
+    "onStart": "ALT+Q \u0026 ALT+E",
+    "onEnd": "ALT+2",
+    "isDebuff": false,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 2458,
+    "name": "Snare (charge)",
+    "onStart": "F11",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 3601,
+    "name": "Overrun",
+    "onStart": "F10",
+    "onEnd": "F3",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 6148,
+    "name": "Serpentis Shield",
+    "onStart": "ALT+Q \u0026 ALT+E",
+    "onEnd": "",
+    "isDebuff": false,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 6829,
+    "name": "Throw Dagger",
+    "onStart": "F11",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 6860,
+    "name": "Impaled",
+    "onStart": "F10",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 13612,
+    "name": "Battle focus",
+    "onStart": "LALT+2",
+    "onEnd": "",
+    "isDebuff": false,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 16842,
+    "name": "Mistsong Nodachi",
+    "onStart": "F12",
+    "onEnd": "",
+    "isDebuff": false,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 18396,
+    "name": "Skewer",
+    "onStart": "F10",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 21402,
+    "name": "Deafened",
+    "onStart": "F11",
+    "onEnd": "",
+    "isDebuff": true,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 8000074,
+    "name": "ezi",
+    "onStart": "LSHIFT+4",
+    "onEnd": "",
+    "isDebuff": false,
+    "cooldownMs": 1000
+  }
+]
