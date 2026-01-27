@@ -2,11 +2,8 @@ package monitor
 
 import (
 	"archefriend/config"
-	"archefriend/input"
 	"archefriend/memory"
-	"encoding/json"
 	"fmt"
-	"os"
 	"time"
 	"unsafe"
 
@@ -32,229 +29,11 @@ type DebuffInfo struct {
 }
 
 type BuffEvent struct {
-	Time      time.Time
-	Action    string // "+" ou "-"
-	ID        uint32
-	Name      string
-	Reacted   bool
-}
-
-
-type BuffWhitelistEntry struct {
-	Type     uint32         `json:"type"`
-	Name     string         `json:"name"`
-	Use      string         `json:"use"`
-	KeyCombo input.KeyCombo `json:"-"`
-}
-
-type BuffWhitelist struct {
-	Entries      []BuffWhitelistEntry
-	TypeMap      map[uint32]*BuffWhitelistEntry
-	Enabled      bool
-	Reactions    int
-	SpamCount    int
-	SpamInterval time.Duration
-	lastSpamTime time.Time
-	spamCooldown time.Duration
-}
-
-func NewBuffWhitelist() *BuffWhitelist {
-	wl := &BuffWhitelist{
-		Entries:      make([]BuffWhitelistEntry, 0),
-		TypeMap:      make(map[uint32]*BuffWhitelistEntry),
-		Enabled:      true,
-		SpamCount:    config.KEY_SPAM_COUNT,
-		SpamInterval: config.KEY_SPAM_INTERVAL,
-		spamCooldown: 100 * time.Millisecond,
-	}
-	wl.LoadFromFile("buff_whitelist.json")
-	return wl
-}
-
-func (wl *BuffWhitelist) LoadFromFile(filename string) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		wl.createDefaultFile(filename)
-		return
-	}
-
-	var entries []BuffWhitelistEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
-		return
-	}
-
-	wl.Entries = entries
-	wl.TypeMap = make(map[uint32]*BuffWhitelistEntry)
-
-	for i := range wl.Entries {
-		wl.Entries[i].KeyCombo = input.ParseKeyCombo(wl.Entries[i].Use)
-		if wl.Entries[i].KeyCombo.MainKey != 0 {
-			wl.TypeMap[wl.Entries[i].Type] = &wl.Entries[i]
-		}
-	}
-}
-
-func (wl *BuffWhitelist) createDefaultFile(filename string) {
-	defaultEntries := []BuffWhitelistEntry{
-		{Type: 87, Name: "Hell Spear", Use: "F10"},
-		{Type: 243, Name: "stun", Use: "SHIFT+1"},
-		{Type: 156, Name: "Fear", Use: "CTRL+2"},
-		{Type: 21402, Name: "Deafened", Use: "ALT+F1"},
-		{Type: 8000210, Name: "Clash Dummy", Use: "SHIFT+5"},
-		{Type: 21, Name: "Tripped (Strong)", Use: "CTRL+SHIFT+1"},
-		{Type: 141, Name: "Tripped", Use: "9"},
-		{Type: 6860, Name: "Impaled", Use: "SHIFT+F10"},
-		{Type: 18396, Name: "Skewer", Use: "F10"},
-		{Type: 2458, Name: "Snare (charge)", Use: "F11"},
-		{Type: 6829, Name: "Throw Dagger", Use: "CTRL+F11"},
-		{Type: 501, Name: "Shield Slam", Use: "F10"},
-		{Type: 3601, Name: "Overrun", Use: "SHIFT+F12"},
-	}
-
-	data, _ := json.MarshalIndent(defaultEntries, "", "  ")
-	os.WriteFile(filename, data, 0644)
-
-	wl.Entries = defaultEntries
-	wl.TypeMap = make(map[uint32]*BuffWhitelistEntry)
-	for i := range wl.Entries {
-		wl.Entries[i].KeyCombo = input.ParseKeyCombo(wl.Entries[i].Use)
-		if wl.Entries[i].KeyCombo.MainKey != 0 {
-			wl.TypeMap[wl.Entries[i].Type] = &wl.Entries[i]
-		}
-	}
-}
-
-func (wl *BuffWhitelist) ReactInstant(buffID uint32) (bool, string) {
-	if !wl.Enabled {
-		return false, ""
-	}
-
-	entry, exists := wl.TypeMap[buffID]
-	if !exists {
-		return false, ""
-	}
-
-	if time.Since(wl.lastSpamTime) < wl.spamCooldown {
-		return false, ""
-	}
-
-	wl.lastSpamTime = time.Now()
-	go input.SpamKey(entry.KeyCombo.RawString, wl.SpamCount, wl.SpamInterval)
-
-	wl.Reactions++
-	return true, entry.Name
-}
-
-func (wl *BuffWhitelist) GetName(buffID uint32) string {
-	if entry, exists := wl.TypeMap[buffID]; exists {
-		return entry.Name
-	}
-	return ""
-}
-
-
-type CCWhitelistEntry struct {
-	Type     uint32         `json:"type"`
-	Name     string         `json:"name"`
-	Use      string         `json:"use"`
-	KeyCombo input.KeyCombo `json:"-"`
-}
-
-type CCWhitelist struct {
-	Entries      []CCWhitelistEntry
-	TypeMap      map[uint32]*CCWhitelistEntry
-	Enabled      bool
-	Reactions    int
-	SpamCount    int
-	SpamInterval time.Duration
-	lastSpamTime time.Time
-	spamCooldown time.Duration
-}
-
-func NewCCWhitelist() *CCWhitelist {
-	wl := &CCWhitelist{
-		Entries:      make([]CCWhitelistEntry, 0),
-		TypeMap:      make(map[uint32]*CCWhitelistEntry),
-		Enabled:      true,
-		SpamCount:    config.KEY_SPAM_COUNT,
-		SpamInterval: config.KEY_SPAM_INTERVAL,
-		spamCooldown: 100 * time.Millisecond,
-	}
-	wl.LoadFromFile("cc_whitelist.json")
-	return wl
-}
-
-func (wl *CCWhitelist) LoadFromFile(filename string) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		wl.createDefaultFile(filename)
-		return
-	}
-
-	var entries []CCWhitelistEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
-		return
-	}
-
-	wl.Entries = entries
-	wl.TypeMap = make(map[uint32]*CCWhitelistEntry)
-
-	for i := range wl.Entries {
-		wl.Entries[i].KeyCombo = input.ParseKeyCombo(wl.Entries[i].Use)
-		if wl.Entries[i].KeyCombo.MainKey != 0 {
-			wl.TypeMap[wl.Entries[i].Type] = &wl.Entries[i]
-		}
-	}
-}
-
-func (wl *CCWhitelist) createDefaultFile(filename string) {
-	defaultEntries := []CCWhitelistEntry{
-		{Type: 3601, Name: "stun", Use: "F12"},
-		{Type: 509, Name: "knockdown", Use: "SHIFT+F12"},
-		{Type: 4622, Name: "sleep", Use: "CTRL+F11"},
-		{Type: 6800, Name: "fear", Use: "F12"},
-		{Type: 20121, Name: "silence", Use: "SHIFT+1"},
-		{Type: 22290, Name: "root", Use: "CTRL+2"},
-	}
-
-	data, _ := json.MarshalIndent(defaultEntries, "", "  ")
-	os.WriteFile(filename, data, 0644)
-
-	wl.Entries = defaultEntries
-	wl.TypeMap = make(map[uint32]*CCWhitelistEntry)
-	for i := range wl.Entries {
-		wl.Entries[i].KeyCombo = input.ParseKeyCombo(wl.Entries[i].Use)
-		if wl.Entries[i].KeyCombo.MainKey != 0 {
-			wl.TypeMap[wl.Entries[i].Type] = &wl.Entries[i]
-		}
-	}
-}
-
-func (wl *CCWhitelist) ReactInstant(typeID uint32) (bool, string) {
-	if !wl.Enabled {
-		return false, ""
-	}
-	entry, exists := wl.TypeMap[typeID]
-	if !exists {
-		return false, ""
-	}
-
-	if time.Since(wl.lastSpamTime) < wl.spamCooldown {
-		return false, ""
-	}
-
-	wl.lastSpamTime = time.Now()
-	go input.SpamKey(entry.KeyCombo.RawString, wl.SpamCount, wl.SpamInterval)
-
-	wl.Reactions++
-	return true, entry.Name
-}
-
-func (wl *CCWhitelist) GetName(typeID uint32) string {
-	if entry, exists := wl.TypeMap[typeID]; exists {
-		return entry.Name
-	}
-	return ""
+	Time    time.Time
+	Action  string
+	ID      uint32
+	Name    string
+	Reacted bool
 }
 
 type ReactionHandler interface {
@@ -274,7 +53,6 @@ type BuffMonitor struct {
 	Events          []BuffEvent
 	KnownIDs        map[uint32]bool
 	RawCount        uint32
-	Whitelist       *BuffWhitelist
 	ReactionHandler ReactionHandler
 
 	OnBuffGained func(buff BuffInfo)
@@ -292,7 +70,6 @@ type DebuffMonitor struct {
 	Events          []BuffEvent
 	KnownIDs        map[uint64]bool
 	RawCount        uint32
-	CCWhitelist     *CCWhitelist
 	ReactionHandler ReactionHandler
 
 	OnDebuffGained func(debuff DebuffInfo)
@@ -309,7 +86,6 @@ func NewBuffMonitor(handle windows.Handle, x2game uintptr) *BuffMonitor {
 		KnownIDs:   make(map[uint32]bool),
 		Events:     make([]BuffEvent, 0, 100),
 		buffBuffer: make([]byte, 30*config.BUFF_SIZE),
-		Whitelist:  NewBuffWhitelist(),
 	}
 }
 
@@ -325,7 +101,6 @@ func NewDebuffMonitor(handle windows.Handle, x2game uintptr) *DebuffMonitor {
 		KnownIDs:     make(map[uint64]bool),
 		Events:       make([]BuffEvent, 0, 100),
 		debuffBuffer: make([]byte, 30*config.DEBUFF_SIZE),
-		CCWhitelist:  NewCCWhitelist(),
 	}
 }
 
@@ -424,19 +199,11 @@ func (m *BuffMonitor) Update(playerAddr uint32) {
 		if !m.KnownIDs[buffID] {
 			m.KnownIDs[buffID] = true
 
-			reacted := false
-			if m.Whitelist != nil {
-				if ok, name := m.Whitelist.ReactInstant(buffID); ok {
-					reacted = true
-					buff.Name = name
-				}
-			}
-
 			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
 				m.ReactionHandler.OnBuffGained(buffID)
 			}
 
-			m.AddEvent("+", buffID, buff.Name, reacted)
+			m.AddEvent("+", buffID, buff.Name, false)
 			if m.OnBuffGained != nil {
 				m.OnBuffGained(buff)
 			}
@@ -563,21 +330,11 @@ func (m *DebuffMonitor) Update(playerAddr uint32) {
 		if !m.KnownIDs[key] {
 			m.KnownIDs[key] = true
 
-			reacted := false
-			ccName := ""
-			if m.CCWhitelist != nil {
-				if ok, name := m.CCWhitelist.ReactInstant(typeID); ok {
-					reacted = true
-					ccName = name
-					debuff.CCName = name
-				}
-			}
-
 			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
 				m.ReactionHandler.OnDebuffGained(typeID)
 			}
 
-			m.AddEvent("+", id, typeID, ccName, reacted)
+			m.AddEvent("+", id, typeID, "", false)
 			if m.OnDebuffGained != nil {
 				m.OnDebuffGained(debuff)
 			}

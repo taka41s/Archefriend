@@ -50,3 +50,8 @@ TROUBLESHOOTING.md
 # AI assistant configs
 .github/copilot-instructions.md
 .claude/
+
+# Deprecated config files
+buff_whitelist.json
+cc_whitelist.json
+debuffs.json

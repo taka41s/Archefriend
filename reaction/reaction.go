@@ -30,11 +30,17 @@ type Reaction struct {
 	lastTrigger int64
 }
 
+type AFKChecker interface {
+	IsAFK() bool
+	IsEnabled() bool
+}
+
 type Manager struct {
-	reactions map[uint32]*Reaction
-	mu        sync.RWMutex
-	cooldown  int64
-	enabled   bool
+	reactions  map[uint32]*Reaction
+	mu         sync.RWMutex
+	cooldown   int64
+	enabled    bool
+	afkChecker AFKChecker
 }
 
 func NewManager() *Manager {
@@ -113,13 +119,34 @@ func (m *Manager) IsEnabled() bool {
 	return m.enabled
 }
 
+func (m *Manager) SetAFKChecker(checker AFKChecker) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.afkChecker = checker
+}
+
+func (m *Manager) isAFK() bool {
+	if m.afkChecker == nil {
+		return false
+	}
+	if !m.afkChecker.IsEnabled() {
+		return false
+	}
+	return m.afkChecker.IsAFK()
+}
+
 func (m *Manager) OnBuffGained(buffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
 	reaction, exists := m.reactions[buffID]
+	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
 	if !enabled || !exists || !reaction.Enabled || reaction.IsDebuff {
+		return
+	}
+
+	if afkChecker != nil && afkChecker.IsEnabled() && afkChecker.IsAFK() {
 		return
 	}
 
@@ -136,9 +163,14 @@ func (m *Manager) OnBuffLost(buffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
 	reaction, exists := m.reactions[buffID]
+	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
 	if !enabled || !exists || !reaction.Enabled || reaction.IsDebuff {
+		return
+	}
+
+	if afkChecker != nil && afkChecker.IsEnabled() && afkChecker.IsAFK() {
 		return
 	}
 
@@ -155,9 +187,14 @@ func (m *Manager) OnDebuffGained(debuffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
 	reaction, exists := m.reactions[debuffID]
+	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
 	if !enabled || !exists || !reaction.Enabled || !reaction.IsDebuff {
+		return
+	}
+
+	if afkChecker != nil && afkChecker.IsEnabled() && afkChecker.IsAFK() {
 		return
 	}
 
@@ -174,9 +211,14 @@ func (m *Manager) OnDebuffLost(debuffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
 	reaction, exists := m.reactions[debuffID]
+	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
 	if !enabled || !exists || !reaction.Enabled || !reaction.IsDebuff {
+		return
+	}
+
+	if afkChecker != nil && afkChecker.IsEnabled() && afkChecker.IsAFK() {
 		return
 	}
 

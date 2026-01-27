@@ -64,7 +64,7 @@ func NewOverlayWindow(width, height int) (*OverlayWindow, error) {
 
 	w.hwnd = windows.Handle(hwnd)
 
-	// Configura transparência
+	// Configure transparency
 	procSetLayeredWindowAttributes.Call(
 		hwnd,
 		0,
@@ -84,12 +84,13 @@ func (w *OverlayWindow) wndProc(hwnd windows.Handle, msg uint32, wParam, lParam 
 		var ps PAINTSTRUCT
 		hdc, _, _ := procBeginPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
 
-		// Limpa a área de desenho com preto (100% transparente)
-		hBrush, _, _ := procCreateSolidBrush.Call(0x00000000) // Preto
+		// Clear drawing area with black
+		hBrush, _, _ := procCreateSolidBrush.Call(0x00000000)
+
 		procFillRect.Call(hdc, uintptr(unsafe.Pointer(&ps.RcPaint)), hBrush)
 		procDeleteObject.Call(hBrush)
 
-		// Cria fonte
+		// Create font
 		lf := LOGFONT{
 			Height: 16,
 			Weight: 400,
@@ -98,11 +99,11 @@ func (w *OverlayWindow) wndProc(hwnd windows.Handle, msg uint32, wParam, lParam 
 		hFont, _, _ := procCreateFontIndirect.Call(uintptr(unsafe.Pointer(&lf)))
 		procSelectObject.Call(hdc, hFont)
 
-		// Fundo transparente
+		// Transparent background
 		procSetBkMode.Call(hdc, TRANSPARENT)
-		procSetTextColor.Call(hdc, 0x00FFFFFF) // Branco
+		procSetTextColor.Call(hdc, 0x00FFFFFF)
 
-		// Desenha linhas
+		// Draw lines
 		if len(w.lines) > 0 {
 			y := int32(10)
 			for _, line := range w.lines {
@@ -137,9 +138,10 @@ func (w *OverlayWindow) SetLines(lines []string) {
 
 func (w *OverlayWindow) Invalidate() {
 	procInvalidateRect.Call(uintptr(w.hwnd), 0, 1)
+	procUpdateWindow.Call(uintptr(w.hwnd))
 }
 
-// FindGameWindow encontra a janela do ArcheAge
+// FindGameWindow finds the ArcheAge window
 func (w *OverlayWindow) FindGameWindow() {
 	// Lista de possíveis títulos da janela do ArcheAge
 	possibleTitles := []string{
@@ -159,7 +161,7 @@ func (w *OverlayWindow) FindGameWindow() {
 	}
 }
 
-// UpdatePosition atualiza a posição do overlay para seguir a janela do jogo
+// UpdatePosition updates the overlay position to follow the game window
 func (w *OverlayWindow) UpdatePosition() {
 	if w.gameHwnd == 0 {
 		w.FindGameWindow()
@@ -171,12 +173,12 @@ func (w *OverlayWindow) UpdatePosition() {
 	var rect RECT
 	ret, _, _ := procGetWindowRect.Call(w.gameHwnd, uintptr(unsafe.Pointer(&rect)))
 	if ret == 0 {
-		// Janela não existe mais, procura novamente
+		// Window no longer exists, search again
 		w.gameHwnd = 0
 		return
 	}
 
-	// Posiciona o overlay no topo da janela do jogo
+	// Position overlay at top of game window
 	x := rect.Left + 10
 	y := rect.Top + 10
 
@@ -218,7 +220,7 @@ func (w *OverlayWindow) GetHWND() uintptr {
 
 func (w *OverlayWindow) ProcessMessages() {
 	var msg MSG
-	// Processa até 10 mensagens por chamada para não bloquear
+	// Process up to 10 messages per call to avoid blocking
 	for i := 0; i < 10; i++ {
 		ret, _, _ := procPeekMessage.Call(
 			uintptr(unsafe.Pointer(&msg)),
@@ -229,7 +231,7 @@ func (w *OverlayWindow) ProcessMessages() {
 		)
 
 		if ret == 0 {
-			// Sem mais mensagens
+			// No more messages
 			return
 		}
 

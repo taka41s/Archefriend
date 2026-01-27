@@ -3,6 +3,7 @@
 package main
 
 import (
+	"archefriend/afk"
 	"archefriend/buff"
 	"archefriend/config"
 	"archefriend/entity"
@@ -35,6 +36,7 @@ type App struct {
 	lootBypass      *loot.Bypass
 	inputManager    *input.Manager
 	reactionManager *reaction.Manager
+	afkMonitor      *afk.Monitor
 	buffMonitor     *monitor.BuffMonitor
 	debuffMonitor   *monitor.DebuffMonitor
 	targetMonitor   *target.Monitor
@@ -91,7 +93,17 @@ func NewApp() (*App, error) {
 
 	app.lootBypass = loot.NewBypass(handle, x2game)
 	app.inputManager = input.NewManager()
+	app.afkMonitor = afk.NewMonitor(10)
+	app.afkMonitor.OnStateChange = func(isAFK bool) {
+		if isAFK {
+			fmt.Println("[AFK] No input detected for 10s - reactions paused")
+		} else {
+			fmt.Println("[AFK] Input detected - reactions resumed")
+		}
+	}
+	app.afkMonitor.Start()
 	app.reactionManager = reaction.NewManager()
+	app.reactionManager.SetAFKChecker(app.afkMonitor)
 	app.buffMonitor = monitor.NewBuffMonitor(handle, x2game)
 	app.debuffMonitor = monitor.NewDebuffMonitor(handle, x2game)
 	app.targetMonitor = target.NewMonitor(handle, x2game)
@@ -291,7 +303,12 @@ func (app *App) pollHotkeys() {
 				app.presetManager.ToggleQuickAction()
 			}
 		},
-		0x7A: func() { // F11 - Diagnóstico
+		0x79: func() { // F10
+			if app.afkMonitor != nil {
+				app.afkMonitor.Toggle()
+			}
+		},
+		0x7A: func() { // F11
 			app.printDiagnostics()
 		},
 	}
@@ -371,9 +388,18 @@ func (app *App) getDisplayLines() []string {
 		reactionStatus = "ON"
 	}
 
+	afkStatus := "-"
+	if app.afkMonitor != nil && app.afkMonitor.IsEnabled() {
+		if app.afkMonitor.IsAFK() {
+			afkStatus = "AFK"
+		} else {
+			afkStatus = "OK"
+		}
+	}
+
 	lines = append(lines, fmt.Sprintf("[F1] Loot:%s  [F2] Doodad:%s  [F3] Spam  [F4] AutoSpam:%s", lootStatus, doodadStatus, spamStatus))
-	lines = append(lines, fmt.Sprintf("[F5] Reload  [F6] Reactions:%s  [END] Hide", reactionStatus))
-	lines = append(lines, "[F7] Config  [F8] Buffs  [F9] Quick")
+	lines = append(lines, fmt.Sprintf("[F5] Reload  [F6] Reactions:%s  [F10] AFK:%s", reactionStatus, afkStatus))
+	lines = append(lines, "[F7] Config  [F8] Buffs  [F9] Quick  [END] Hide")
 	lines = append(lines, fmt.Sprintf("Quick:%s (%s)", quickStatus, quickPreset))
 
 	return lines
@@ -446,6 +472,14 @@ func (app *App) printDiagnostics() {
 		}
 	}
 
+	if app.afkMonitor != nil {
+		fmt.Printf("\n[AFK MONITOR]\n")
+		fmt.Printf("  Enabled: %v\n", app.afkMonitor.IsEnabled())
+		fmt.Printf("  Timeout: %ds\n", app.afkMonitor.GetTimeout())
+		fmt.Printf("  Idle: %ds\n", app.afkMonitor.GetIdleSeconds())
+		fmt.Printf("  Is AFK: %v\n", app.afkMonitor.IsAFK())
+	}
+
 	if app.reactionManager != nil {
 		fmt.Printf("\n[REACTION MANAGER]\n")
 		fmt.Printf("  Enabled: %v\n", app.reactionManager.IsEnabled())
@@ -477,6 +511,9 @@ func (app *App) Close() {
 	if app.inputManager != nil && app.inputManager.IsAutoSpamming() {
 		app.inputManager.StopAutoSpam()
 	}
+	if app.afkMonitor != nil {
+		app.afkMonitor.Stop()
+	}
 	if app.lootBypass != nil {
 		app.lootBypass.Cleanup()
 	}
@@ -492,13 +529,12 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	fmt.Println("╔═══════════════════════════════════════╗")
-	fmt.Println("║      ARCHEFRIEND OVERLAY v3.0         ║")
+	fmt.Println("║      ARCHEFRIEND OVERLAY v3.1         ║")
 	fmt.Println("╠═══════════════════════════════════════╣")
-	fmt.Println("║  Win32 Pure Overlay (No Background!)  ║")
 	fmt.Println("║  F1: Loot | F2: Doodad | F3: Spam    ║")
 	fmt.Println("║  F4: Auto | F5: Reload | F6: React   ║")
-	fmt.Println("║  F7: Config | F8: Buffs | END: Hide  ║")
-	fmt.Println("║  F9: Quick | F11: Diagnostico        ║")
+	fmt.Println("║  F7: Config | F8: Buffs | F9: Quick  ║")
+	fmt.Println("║  F10: AFK  | F11: Diag  | END: Hide  ║")
 	fmt.Println("╚═══════════════════════════════════════╝")
 	fmt.Println()
 
