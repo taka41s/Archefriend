@@ -1,0 +1,49 @@
+{
+  "reactions": [
+    {
+      "skillId": 23593,
+      "name": "Gods whip",
+      "onCast": "E \u0026 T",
+      "enabled": true,
+      "cooldownMs": 500,
+      "useAimbot": true,
+      "aimbotOnTry": false
+    },
+    {
+      "skillId": 23646,
+      "name": "2nd Gods whip",
+      "onCast": "E \u0026 T",
+      "enabled": true,
+      "cooldownMs": 500,
+      "useAimbot": true,
+      "aimbotOnTry": false
+    },
+    {
+      "skillId": 23647,
+      "name": "3rd gods whip ",
+      "onCast": "E \u0026 T",
+      "enabled": true,
+      "cooldownMs": 500,
+      "useAimbot": true,
+      "aimbotOnTry": false
+    },
+    {
+      "skillId": 23648,
+      "name": "4th gods whip",
+      "onCast": "E \u0026 T",
+      "enabled": true,
+      "cooldownMs": 500,
+      "useAimbot": true,
+      "aimbotOnTry": false
+    },
+    {
+      "skillId": 23649,
+      "name": "5th gods whip",
+      "onCast": "E",
+      "enabled": true,
+      "cooldownMs": 500,
+      "useAimbot": true,
+      "aimbotOnTry": false
+    }
+  ]
+}

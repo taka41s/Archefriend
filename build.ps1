@@ -44,7 +44,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ""
 Write-Host "Copiando arquivos de configuracao..." -ForegroundColor Green
 
-$jsonFiles = @("reactions.json", "buff_presets.json")
+$jsonFiles = @("reactions.json", "buff_presets.json", "skill_reactions.json")
 foreach ($file in $jsonFiles) {
     if (Test-Path $file) {
         Copy-Item $file "$BUILD_DIR\" -Force
@@ -86,6 +86,10 @@ Configuracao:
   * Campos: onStart (quando ganha), onEnd (quando perde)
 
 - buff_presets.json: Presets de buffs para monitoramento
+
+- skill_reactions.json: Reacoes de skills
+  * Configura teclas a pressionar quando uma skill e usada
+  * Suporte a aimbot antes ou durante o cast
 
 Desenvolvido com Win32 API puro em Go
 "@

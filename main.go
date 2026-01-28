@@ -7,12 +7,14 @@ import (
 	"archefriend/buff"
 	"archefriend/config"
 	"archefriend/entity"
+	"archefriend/esp"
 	"archefriend/gui"
 	"archefriend/input"
 	"archefriend/loot"
 	"archefriend/monitor"
 	"archefriend/process"
 	"archefriend/reaction"
+	"archefriend/skill"
 	"archefriend/target"
 	"fmt"
 	"runtime"
@@ -42,12 +44,16 @@ type App struct {
 	targetMonitor   *target.Monitor
 	buffInjector    *buff.Injector
 	presetManager   *buff.PresetManager
-	keybinds        *config.KeybindsConfig
+	espManager           *esp.Manager
+	skillMonitor         *skill.SkillMonitor
+	skillReactionManager *skill.ReactionManager
+	keybinds             *config.KeybindsConfig
 
-	window       *gui.OverlayWindow
-	configWindow *gui.ConfigWindow
-	buffWindow   *gui.BuffWindow
-	visible      bool
+	window            *gui.OverlayWindow
+	configWindow      *gui.ConfigWindow
+	buffWindow        *gui.BuffWindow
+	skillConfigWindow *gui.SkillConfigWindow
+	visible           bool
 	keyStates    map[int]bool
 	frameCount   int
 
@@ -111,6 +117,65 @@ func NewApp() (*App, error) {
 	app.presetManager = buff.NewPresetManager(app.buffInjector)
 	app.buffInjector.StartFreezeLoop()
 
+	// Create ESP manager
+	espMgr, err := esp.NewManager(uintptr(handle), pid, x2game)
+	if err != nil {
+		fmt.Printf("[WARN] Falha ao criar ESP: %v\n", err)
+	} else {
+		app.espManager = espMgr
+	}
+
+	// Create Skill monitor (offset 0x569E1A para hook de skill success)
+	app.skillMonitor = skill.NewSkillMonitor(handle, x2game, 0x569E1A)
+	if err := app.skillMonitor.LoadConfig("skills.json"); err != nil {
+		fmt.Printf("[SKILL] Config não encontrada, usando padrão\n")
+	}
+
+	// Create Skill reaction manager
+	app.skillReactionManager = skill.NewReactionManager()
+	if err := app.skillReactionManager.LoadFromJSON("skill_reactions.json"); err != nil {
+		fmt.Printf("[SKILL-REACT] Config não encontrada, criando padrão\n")
+		skill.SaveDefaultReactions("skill_reactions.json")
+		app.skillReactionManager.LoadFromJSON("skill_reactions.json")
+	}
+
+	// Configurar parser e executor de teclas
+	app.skillReactionManager.SetKeyParser(input.ParseKeySequence)
+	app.skillReactionManager.ExecuteKeys = input.SendKeySequence
+
+	// Configurar aimbot callback
+	app.skillReactionManager.AimAtTarget = func() bool {
+		if app.espManager != nil {
+			return app.espManager.AimAtTarget()
+		}
+		return false
+	}
+
+	// Callback para printar skill usada E executar reações
+	app.skillMonitor.OnSkillCast = func(skillID uint32) {
+		name := app.skillMonitor.GetSkillName(skillID)
+		fmt.Printf("[SKILL] >>> %s (ID:%d) usado! <<<\n", name, skillID)
+
+		// Executar reação se configurada
+		app.skillReactionManager.OnSkillCast(skillID)
+	}
+
+	// Callback para tentativa de uso de skill (antes do cast)
+	app.skillMonitor.OnSkillTry = func(skillID uint32) {
+		name := app.skillMonitor.GetSkillName(skillID)
+		fmt.Printf("[SKILL-TRY] Tentando usar %s (ID:%d)\n", name, skillID)
+
+		// Executar aimbot se configurado para OnTry
+		app.skillReactionManager.OnSkillTry(skillID)
+	}
+
+	// Ativar hook automaticamente
+	if err := app.skillMonitor.InstallHook(); err != nil {
+		fmt.Printf("[SKILL] Falha ao instalar hook: %v\n", err)
+	} else {
+		fmt.Println("[SKILL] Monitor de skills ATIVADO")
+	}
+
 	if err := app.presetManager.LoadFromJSON("buff_presets.json"); err != nil {
 		app.presetManager.CreateDefaultPresets()
 		app.presetManager.SaveToJSON("buff_presets.json")
@@ -130,10 +195,25 @@ func NewApp() (*App, error) {
 		app.buffWindow = buffWindow
 	}
 
-	app.buffMonitor.OnBuffGained = func(buff monitor.BuffInfo) {}
-	app.buffMonitor.OnBuffLost = func(buffID uint32) {}
-	app.debuffMonitor.OnDebuffGained = func(debuff monitor.DebuffInfo) {}
-	app.debuffMonitor.OnDebuffLost = func(debuffTypeID uint32) {}
+	skillConfigWindow, err := gui.NewSkillConfigWindow(app.skillReactionManager, "skill_reactions.json")
+	if err == nil {
+		app.skillConfigWindow = skillConfigWindow
+	}
+
+	// Setup reaction callbacks
+	app.buffMonitor.OnBuffGained = func(buff monitor.BuffInfo) {
+		app.reactionManager.OnBuffGained(buff.ID)
+	}
+	app.buffMonitor.OnBuffLost = func(buffID uint32) {
+		app.reactionManager.OnBuffLost(buffID)
+	}
+	app.debuffMonitor.OnDebuffGained = func(debuff monitor.DebuffInfo) {
+		fmt.Printf("[MAIN] Debuff detectado: TypeID:%d (instance ID:%d)\n", debuff.TypeID, debuff.ID)
+		app.reactionManager.OnDebuffGained(debuff.TypeID)
+	}
+	app.debuffMonitor.OnDebuffLost = func(debuffTypeID uint32) {
+		app.reactionManager.OnDebuffLost(debuffTypeID)
+	}
 
 	app.startBackgroundTasks()
 
@@ -212,6 +292,11 @@ func (app *App) monitorLoop() {
 
 				app.buffMonitor.Update(playerAddr)
 				app.debuffMonitor.Update(playerAddr)
+
+				// Update skill monitor
+				if app.skillMonitor != nil && app.skillMonitor.Enabled {
+					app.skillMonitor.Update()
+				}
 
 				if app.buffInjector != nil {
 					buffListAddr := app.buffMonitor.GetBuffListAddr(playerAddr)
@@ -311,6 +396,45 @@ func (app *App) pollHotkeys() {
 		0x7A: func() { // F11
 			app.printDiagnostics()
 		},
+		0x7B: func() { // F12
+			if app.espManager != nil {
+				enabled := app.espManager.Toggle()
+				status := "OFF"
+				if enabled {
+					status = "ON"
+				}
+				fmt.Printf("[ESP] Target ESP: %s\n", status)
+			}
+		},
+		0x24: func() { // HOME - Cycle ESP style
+			if app.espManager != nil && app.espManager.IsEnabled() {
+				style := app.espManager.CycleStyle()
+				fmt.Printf("[ESP] Style: %s\n", app.espManager.GetStyleName())
+				_ = style
+			}
+		},
+		0x2D: func() { // INSERT - Toggle Aimbot
+			if app.espManager != nil {
+				enabled := app.espManager.ToggleAimbot()
+				status := "OFF"
+				if enabled {
+					status = "ON"
+				}
+				fmt.Printf("[ESP] Aimbot: %s\n", status)
+			}
+		},
+		0x22: func() { // PAGE DOWN - Aim once
+			if app.espManager != nil && app.espManager.IsEnabled() {
+				if app.espManager.AimAtTarget() {
+					fmt.Println("[ESP] Aimed at target")
+				}
+			}
+		},
+		0x21: func() { // PAGE UP - Skill Config Window
+			if app.skillConfigWindow != nil {
+				app.skillConfigWindow.Toggle()
+			}
+		},
 	}
 
 	for vk, callback := range keys {
@@ -397,9 +521,21 @@ func (app *App) getDisplayLines() []string {
 		}
 	}
 
+	espStatus := "OFF"
+	espStyle := ""
+	aimbotStatus := "OFF"
+	if app.espManager != nil && app.espManager.IsEnabled() {
+		espStatus = "ON"
+		espStyle = app.espManager.GetStyleName()
+	}
+	if app.espManager != nil && app.espManager.IsAimbotEnabled() {
+		aimbotStatus = "ON"
+	}
+
 	lines = append(lines, fmt.Sprintf("[F1] Loot:%s  [F2] Doodad:%s  [F3] Spam  [F4] AutoSpam:%s", lootStatus, doodadStatus, spamStatus))
 	lines = append(lines, fmt.Sprintf("[F5] Reload  [F6] Reactions:%s  [F10] AFK:%s", reactionStatus, afkStatus))
-	lines = append(lines, "[F7] Config  [F8] Buffs  [F9] Quick  [END] Hide")
+	lines = append(lines, fmt.Sprintf("[F12] ESP:%s %s  [INS] Aim:%s  [PGDN] Aim", espStatus, espStyle, aimbotStatus))
+	lines = append(lines, "[F7] Config  [F8] Buffs  [F9] Quick  [PGUP] Skills  [END] Hide")
 	lines = append(lines, fmt.Sprintf("Quick:%s (%s)", quickStatus, quickPreset))
 
 	return lines
@@ -520,6 +656,12 @@ func (app *App) Close() {
 	if app.buffInjector != nil {
 		app.buffInjector.StopFreezeLoop()
 	}
+	if app.espManager != nil {
+		app.espManager.Close()
+	}
+	if app.skillMonitor != nil {
+		app.skillMonitor.Close()
+	}
 	if app.handle != 0 {
 		windows.CloseHandle(app.handle)
 	}
@@ -529,12 +671,14 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	fmt.Println("╔═══════════════════════════════════════╗")
-	fmt.Println("║      ARCHEFRIEND OVERLAY v3.1         ║")
+	fmt.Println("║      ARCHEFRIEND OVERLAY v3.4         ║")
 	fmt.Println("╠═══════════════════════════════════════╣")
 	fmt.Println("║  F1: Loot | F2: Doodad | F3: Spam    ║")
 	fmt.Println("║  F4: Auto | F5: Reload | F6: React   ║")
 	fmt.Println("║  F7: Config | F8: Buffs | F9: Quick  ║")
-	fmt.Println("║  F10: AFK  | F11: Diag  | END: Hide  ║")
+	fmt.Println("║  F10: AFK | F11: Diag | F12: ESP     ║")
+	fmt.Println("║  INS: Aimbot | PGDN: Aim | HOME: Sty ║")
+	fmt.Println("║  PGUP: Skill Config | END: Hide      ║")
 	fmt.Println("╚═══════════════════════════════════════╝")
 	fmt.Println()
 

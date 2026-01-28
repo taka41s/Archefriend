@@ -35,6 +35,7 @@ echo.
 echo Copiando arquivos de configuracao...
 copy reactions.json %BUILD_DIR%\ >nul 2>&1
 copy buff_presets.json %BUILD_DIR%\ >nul 2>&1
+copy skill_reactions.json %BUILD_DIR%\ >nul 2>&1
 
 REM Cria um README simples
 echo.
@@ -64,6 +65,7 @@ echo.
 echo Configuracao:
 echo - reactions.json: Reacoes de buffs/debuffs
 echo - buff_presets.json: Presets de buffs
+echo - skill_reactions.json: Reacoes de skills
 echo.
 ) > %BUILD_DIR%\README.txt
 

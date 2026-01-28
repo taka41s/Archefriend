@@ -1,0 +1,32 @@
+{
+  "skills": [
+    {
+      "id": 10005,
+      "name": "Fireball",
+      "cooldownMs": 8000,
+      "category": "Magic",
+      "track": true
+    },
+    {
+      "id": 10006,
+      "name": "Meteor",
+      "cooldownMs": 45000,
+      "category": "Magic",
+      "track": true
+    },
+    {
+      "id": 10010,
+      "name": "Charge",
+      "cooldownMs": 18000,
+      "category": "Melee",
+      "track": true
+    },
+    {
+      "id": 10015,
+      "name": "Heal",
+      "cooldownMs": 15000,
+      "category": "Support",
+      "track": true
+    }
+  ]
+}
