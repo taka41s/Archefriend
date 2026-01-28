@@ -2,8 +2,10 @@ package esp
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -46,19 +48,24 @@ var (
 	procFillRect                   = user32.NewProc("FillRect")
 	procDestroyWindow              = user32.NewProc("DestroyWindow")
 	procSetCursorPos               = user32.NewProc("SetCursorPos")
+	procGetAsyncKeyState           = user32.NewProc("GetAsyncKeyState")
 
-	procCreatePen        = gdi32.NewProc("CreatePen")
-	procSelectObject     = gdi32.NewProc("SelectObject")
-	procDeleteObject     = gdi32.NewProc("DeleteObject")
-	procMoveToEx         = gdi32.NewProc("MoveToEx")
-	procLineTo           = gdi32.NewProc("LineTo")
-	procSetBkMode        = gdi32.NewProc("SetBkMode")
-	procSetTextColor     = gdi32.NewProc("SetTextColor")
-	procTextOutW         = gdi32.NewProc("TextOutW")
-	procGetStockObject   = gdi32.NewProc("GetStockObject")
-	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
-	procCreateFont       = gdi32.NewProc("CreateFontW")
-	procEllipse          = gdi32.NewProc("Ellipse")
+	procCreatePen          = gdi32.NewProc("CreatePen")
+	procSelectObject       = gdi32.NewProc("SelectObject")
+	procDeleteObject       = gdi32.NewProc("DeleteObject")
+	procMoveToEx           = gdi32.NewProc("MoveToEx")
+	procLineTo             = gdi32.NewProc("LineTo")
+	procSetBkMode          = gdi32.NewProc("SetBkMode")
+	procSetTextColor       = gdi32.NewProc("SetTextColor")
+	procTextOutW           = gdi32.NewProc("TextOutW")
+	procGetStockObject     = gdi32.NewProc("GetStockObject")
+	procCreateSolidBrush   = gdi32.NewProc("CreateSolidBrush")
+	procCreateFont         = gdi32.NewProc("CreateFontW")
+	procEllipse            = gdi32.NewProc("Ellipse")
+	procCreateCompatibleDC = gdi32.NewProc("CreateCompatibleDC")
+	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
+	procBitBlt             = gdi32.NewProc("BitBlt")
+	procDeleteDC           = gdi32.NewProc("DeleteDC")
 
 	procDwmExtendFrameIntoClientArea = dwmapi.NewProc("DwmExtendFrameIntoClientArea")
 )
@@ -92,6 +99,7 @@ const (
 	TRANSPARENT = 1
 	NULL_BRUSH  = 5
 	FW_BOLD     = 700
+	SRCCOPY     = 0x00CC0020
 )
 
 // Cores para distância
@@ -108,9 +116,17 @@ const (
 const (
 	gEnvPtr    = 0x39EA2074
 	targetBase = 0x3AB81E98
-	targetPosX = 0x320
-	targetPosY = 0x328
-	targetPosZ = 0x324
+
+	// Player target offsets
+	playerTargetPosX = 0x6A4
+	playerTargetPosY = 0x6AC
+	playerTargetPosZ = 0x6A8
+
+	// Flag de tipo de target: 1 = mob/NPC, 0 = player
+	targetTypeFlag = 0x028
+
+	// ID do target atual (0 = sem target, != 0 = target selecionado)
+	targetIDOffset = 0x008
 
 	// Target pointer (para verificar se tem target selecionado)
 	PTR_ENEMY_TARGET uintptr = 0x19EBF4
@@ -190,15 +206,23 @@ type Manager struct {
 	hdc           uintptr
 	font          uintptr
 
+	// Double buffering
+	backDC     uintptr
+	backBitmap uintptr
+	oldBitmap  uintptr
+
 	// Configuracoes visuais
 	Style        ESPStyle
 	CornerLength int32
 	BoxThickness int32
 
 	// Aimbot
-	aimbotEnabled bool
-	lastTargetX   int32
-	lastTargetY   int32
+	aimbotEnabled   bool
+	aimbotRunning   bool
+	aimbotStopChan  chan bool
+	aimbotKeys      []int // Teclas que ativam o aimbot quando pressionadas
+	lastTargetX     int32
+	lastTargetY     int32
 }
 
 func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
@@ -224,14 +248,15 @@ func enumWindowsCallback(hwnd uintptr, lParam uintptr) uintptr {
 // NewManager cria um novo ESP manager
 func NewManager(processHandle uintptr, pid uint32, x2game uintptr) (*Manager, error) {
 	m := &Manager{
-		processHandle: processHandle,
-		x2game:        x2game,
-		enabled:       false,
-		running:       false,
-		stopChan:      make(chan bool),
-		Style:         StyleCorners,
-		CornerLength:  12,
-		BoxThickness:  2,
+		processHandle:  processHandle,
+		x2game:         x2game,
+		enabled:        false,
+		running:        false,
+		stopChan:       make(chan bool),
+		aimbotStopChan: make(chan bool),
+		Style:          StyleCorners,
+		CornerLength:   12,
+		BoxThickness:   2,
 	}
 
 	// Allocate shellcode
@@ -282,6 +307,11 @@ func NewManager(processHandle uintptr, pid uint32, x2game uintptr) (*Manager, er
 	procDwmExtendFrameIntoClientArea.Call(hwnd, uintptr(unsafe.Pointer(&margins)))
 
 	m.hdc, _, _ = procGetDC.Call(m.overlayHwnd)
+
+	// Create back buffer for double buffering (elimina flickering)
+	m.backDC, _, _ = procCreateCompatibleDC.Call(m.hdc)
+	m.backBitmap, _, _ = procCreateCompatibleBitmap.Call(m.hdc, uintptr(m.screenW), uintptr(m.screenH))
+	m.oldBitmap, _, _ = procSelectObject.Call(m.backDC, m.backBitmap)
 
 	// Create modern font
 	fontName := syscall.StringToUTF16Ptr("Segoe UI")
@@ -334,6 +364,16 @@ func (m *Manager) Close() {
 	m.Stop()
 	if m.font != 0 {
 		procDeleteObject.Call(m.font)
+	}
+	// Clean up back buffer
+	if m.backDC != 0 {
+		if m.oldBitmap != 0 {
+			procSelectObject.Call(m.backDC, m.oldBitmap)
+		}
+		if m.backBitmap != 0 {
+			procDeleteObject.Call(m.backBitmap)
+		}
+		procDeleteDC.Call(m.backDC)
 	}
 	if m.hdc != 0 {
 		procReleaseDC.Call(m.overlayHwnd, m.hdc)
@@ -411,20 +451,60 @@ func (m *Manager) HasTarget() bool {
 	return targetPtr != 0
 }
 
-// GetTarget retorna a posicao do alvo atual
+// GetTarget retorna a posicao do alvo atual (apenas player targets)
 func (m *Manager) GetTarget() (float32, float32, float32, bool) {
-	// Primeiro verifica se tem target selecionado
-	if !m.HasTarget() {
+	// Verifica se tem target usando o ID
+	if !m.HasTargetByID() {
 		return 0, 0, 0, false
 	}
 
-	x := m.readFloat32(targetBase + targetPosX)
-	y := m.readFloat32(targetBase + targetPosY)
-	z := m.readFloat32(targetBase + targetPosZ)
+	// Player target coords (se for mob, essas coords estarao zeradas)
+	x := m.readFloat32(targetBase + playerTargetPosX)
+	y := m.readFloat32(targetBase + playerTargetPosY)
+	z := m.readFloat32(targetBase + playerTargetPosZ)
+
 	if x == 0 && y == 0 && z == 0 {
 		return 0, 0, 0, false
 	}
 	return x, y, z, true
+}
+
+// DebugTargetInfo printa informacoes de debug sobre o target atual
+func (m *Manager) DebugTargetInfo() {
+	targetID := m.readU32(targetBase + targetIDOffset)
+	flag := m.readU32(targetBase + targetTypeFlag)
+
+	playerX := m.readFloat32(targetBase + playerTargetPosX)
+	playerY := m.readFloat32(targetBase + playerTargetPosY)
+	playerZ := m.readFloat32(targetBase + playerTargetPosZ)
+
+	hasTarget := "NO"
+	if targetID != 0 {
+		hasTarget = "YES"
+	}
+
+	targetType := "PLAYER"
+	if flag == 1 {
+		targetType = "MOB (ignorado)"
+	}
+
+	fmt.Printf("[DEBUG] TargetID: 0x%X (%s) | Type: %s (flag=%d)\n", targetID, hasTarget, targetType, flag)
+	fmt.Printf("[DEBUG] Player coords: (%.1f, %.1f, %.1f)\n", playerX, playerY, playerZ)
+}
+
+// HasTargetByID verifica se tem target usando o ID
+func (m *Manager) HasTargetByID() bool {
+	targetID := m.readU32(targetBase + targetIDOffset)
+	return targetID != 0
+}
+
+// HasPlayerTarget verifica se tem um player como target
+func (m *Manager) HasPlayerTarget() bool {
+	if !m.HasTargetByID() {
+		return false
+	}
+	flag := m.readU32(targetBase + targetTypeFlag)
+	return flag == 0
 }
 
 // CalculateDistance calcula a distancia 3D entre dois pontos
@@ -459,6 +539,7 @@ func (m *Manager) Enable() {
 	if !m.running {
 		m.running = true
 		go m.renderLoop()
+		go m.aimbotLoop() // Aimbot em goroutine separada
 	}
 }
 
@@ -505,16 +586,29 @@ func (m *Manager) clearOverlay() {
 	procDeleteObject.Call(brush)
 }
 
+func (m *Manager) clearBackBuffer() {
+	brush, _, _ := procCreateSolidBrush.Call(TRANSPARENT_COLOR)
+	rect := RECT{0, 0, m.screenW, m.screenH}
+	procFillRect.Call(m.backDC, uintptr(unsafe.Pointer(&rect)), brush)
+	procDeleteObject.Call(brush)
+}
+
+func (m *Manager) present() {
+	// Copia o back buffer para a tela de uma vez (elimina flickering)
+	procBitBlt.Call(m.hdc, 0, 0, uintptr(m.screenW), uintptr(m.screenH),
+		m.backDC, 0, 0, SRCCOPY)
+}
+
 // ============================================================================
 // Drawing Functions
 // ============================================================================
 
 func (m *Manager) drawLine(x1, y1, x2, y2 int32, color uintptr, thickness int) {
 	pen, _, _ := procCreatePen.Call(PS_SOLID, uintptr(thickness), color)
-	oldPen, _, _ := procSelectObject.Call(m.hdc, pen)
-	procMoveToEx.Call(m.hdc, uintptr(x1), uintptr(y1), 0)
-	procLineTo.Call(m.hdc, uintptr(x2), uintptr(y2))
-	procSelectObject.Call(m.hdc, oldPen)
+	oldPen, _, _ := procSelectObject.Call(m.backDC, pen)
+	procMoveToEx.Call(m.backDC, uintptr(x1), uintptr(y1), 0)
+	procLineTo.Call(m.backDC, uintptr(x2), uintptr(y2))
+	procSelectObject.Call(m.backDC, oldPen)
 	procDeleteObject.Call(pen)
 }
 
@@ -584,36 +678,36 @@ func (m *Manager) drawCircle(centerX, centerY, radius int32, color uintptr) {
 
 	// Outline
 	pen1, _, _ := procCreatePen.Call(PS_SOLID, uintptr(thick+2), COLOR_BLACK)
-	oldPen1, _, _ := procSelectObject.Call(m.hdc, pen1)
+	oldPen1, _, _ := procSelectObject.Call(m.backDC, pen1)
 	nullBrush, _, _ := procGetStockObject.Call(NULL_BRUSH)
-	oldBrush, _, _ := procSelectObject.Call(m.hdc, nullBrush)
-	procEllipse.Call(m.hdc, uintptr(centerX-radius-1), uintptr(centerY-radius-1), uintptr(centerX+radius+1), uintptr(centerY+radius+1))
-	procSelectObject.Call(m.hdc, oldPen1)
+	oldBrush, _, _ := procSelectObject.Call(m.backDC, nullBrush)
+	procEllipse.Call(m.backDC, uintptr(centerX-radius-1), uintptr(centerY-radius-1), uintptr(centerX+radius+1), uintptr(centerY+radius+1))
+	procSelectObject.Call(m.backDC, oldPen1)
 	procDeleteObject.Call(pen1)
 
 	// Main circle
 	pen2, _, _ := procCreatePen.Call(PS_SOLID, uintptr(thick), color)
-	oldPen2, _, _ := procSelectObject.Call(m.hdc, pen2)
-	procEllipse.Call(m.hdc, uintptr(centerX-radius), uintptr(centerY-radius), uintptr(centerX+radius), uintptr(centerY+radius))
-	procSelectObject.Call(m.hdc, oldPen2)
-	procSelectObject.Call(m.hdc, oldBrush)
+	oldPen2, _, _ := procSelectObject.Call(m.backDC, pen2)
+	procEllipse.Call(m.backDC, uintptr(centerX-radius), uintptr(centerY-radius), uintptr(centerX+radius), uintptr(centerY+radius))
+	procSelectObject.Call(m.backDC, oldPen2)
+	procSelectObject.Call(m.backDC, oldBrush)
 	procDeleteObject.Call(pen2)
 }
 
 func (m *Manager) drawText(x, y int32, text string, color uintptr) {
 	if m.font != 0 {
-		procSelectObject.Call(m.hdc, m.font)
+		procSelectObject.Call(m.backDC, m.font)
 	}
 
 	// Shadow
-	procSetBkMode.Call(m.hdc, TRANSPARENT)
-	procSetTextColor.Call(m.hdc, COLOR_BLACK)
+	procSetBkMode.Call(m.backDC, TRANSPARENT)
+	procSetTextColor.Call(m.backDC, COLOR_BLACK)
 	textPtr := syscall.StringToUTF16Ptr(text)
-	procTextOutW.Call(m.hdc, uintptr(x+1), uintptr(y+1), uintptr(unsafe.Pointer(textPtr)), uintptr(len(text)))
+	procTextOutW.Call(m.backDC, uintptr(x+1), uintptr(y+1), uintptr(unsafe.Pointer(textPtr)), uintptr(len(text)))
 
 	// Main text
-	procSetTextColor.Call(m.hdc, color)
-	procTextOutW.Call(m.hdc, uintptr(x), uintptr(y), uintptr(unsafe.Pointer(textPtr)), uintptr(len(text)))
+	procSetTextColor.Call(m.backDC, color)
+	procTextOutW.Call(m.backDC, uintptr(x), uintptr(y), uintptr(unsafe.Pointer(textPtr)), uintptr(len(text)))
 }
 
 func (m *Manager) renderLoop() {
@@ -624,7 +718,7 @@ func (m *Manager) renderLoop() {
 		default:
 		}
 
-		time.Sleep(16 * time.Millisecond) // ~60 FPS
+		time.Sleep(8 * time.Millisecond) // ~120 FPS para aimbot mais responsivo
 
 		// Process messages
 		var msg MSG
@@ -637,39 +731,33 @@ func (m *Manager) renderLoop() {
 			procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
 		}
 
+		// Aimbot agora roda em goroutine separada (aimbotLoop)
+
 		if !m.enabled {
+			m.clearOverlay() // Limpa quando desabilitado
 			continue
 		}
-
-		// Clear
-		m.clearOverlay()
 
 		// Get player position
 		playerX, playerY, playerZ, hasPlayer := m.GetPlayerPosition()
 		if !hasPlayer {
+			m.clearOverlay()
 			continue
 		}
 
-		// Get target - verifica se tem target selecionado
+		// Get player target (ignora mobs)
 		targetX, targetY, targetZ, hasTarget := m.GetTarget()
 		if !hasTarget {
-			// Clear aimbot position when no target
 			m.lastTargetX = 0
 			m.lastTargetY = 0
-			continue
-		}
-
-		// Double check: se posicao for invalida, nao desenha
-		if targetX == 0 && targetY == 0 && targetZ == 0 {
-			m.lastTargetX = 0
-			m.lastTargetY = 0
+			m.clearOverlay()
 			continue
 		}
 
 		// Calculate distance
 		distance := CalculateDistance(playerX, playerY, playerZ, targetX, targetY, targetZ)
 
-		// Get color based on distance
+		// Cor baseada na distancia
 		color := GetColorByDistance(distance)
 
 		// WorldToScreen (ordem: X, Z, Y)
@@ -680,6 +768,7 @@ func (m *Manager) renderLoop() {
 		pixelY := int32(screenY * float32(m.screenH) / 100.0)
 
 		if pixelX <= 0 || pixelX >= m.screenW || pixelY <= 0 || pixelY >= m.screenH {
+			m.clearOverlay()
 			continue
 		}
 
@@ -687,13 +776,17 @@ func (m *Manager) renderLoop() {
 		m.lastTargetX = pixelX
 		m.lastTargetY = pixelY
 
+		// === DOUBLE BUFFERING ===
+		// 1. Limpa o back buffer
+		m.clearBackBuffer()
+
 		// Box dimensions (menor)
 		boxW := int32(30)
 		boxH := int32(50)
 		boxX := pixelX - boxW/2
 		boxY := pixelY - boxH/2
 
-		// Draw box based on style with distance color
+		// 2. Desenha tudo no back buffer
 		switch m.Style {
 		case StyleCorners:
 			m.drawCorners(boxX, boxY, boxW, boxH, color)
@@ -705,9 +798,12 @@ func (m *Manager) renderLoop() {
 			m.drawBrackets(boxX, boxY, boxW, boxH, color)
 		}
 
-		// Draw distance text
-		distText := fmt.Sprintf("%.1fm", distance)
-		m.drawText(pixelX-15, boxY-18, distText, color)
+		// Draw label com distancia
+		labelText := fmt.Sprintf("PLAYER %.0fm", distance)
+		m.drawText(pixelX-25, boxY-18, labelText, color)
+
+		// 3. Copia o back buffer para a tela de uma vez (sem flicker)
+		m.present()
 	}
 }
 
@@ -763,15 +859,176 @@ func (m *Manager) IsAimbotEnabled() bool {
 	return m.aimbotEnabled
 }
 
+// SetAimbotKeys configura as teclas que ativam o aimbot quando pressionadas
+func (m *Manager) SetAimbotKeys(keys []int) {
+	m.aimbotKeys = keys
+}
+
+// AddAimbotKey adiciona uma tecla ao aimbot
+func (m *Manager) AddAimbotKey(key int) {
+	m.aimbotKeys = append(m.aimbotKeys, key)
+}
+
+// GetAimbotKeys retorna as teclas configuradas
+func (m *Manager) GetAimbotKeys() []int {
+	return m.aimbotKeys
+}
+
+// ClearAimbotKeys limpa todas as teclas do aimbot
+func (m *Manager) ClearAimbotKeys() {
+	m.aimbotKeys = nil
+}
+
+// AimbotKeyConfig representa uma tecla configurada
+type AimbotKeyConfig struct {
+	Name string `json:"name"`
+	Code int    `json:"code"`
+}
+
+// AimbotConfig representa a configuracao do aimbot
+type AimbotConfig struct {
+	Enabled bool              `json:"enabled"`
+	Keys    []AimbotKeyConfig `json:"keys"`
+}
+
+// LoadAimbotConfig carrega a configuracao do aimbot de um arquivo JSON
+func (m *Manager) LoadAimbotConfig(filename string) error {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	var config AimbotConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return err
+	}
+
+	// Aplicar configuracao
+	m.aimbotEnabled = config.Enabled
+	m.aimbotKeys = nil
+	for _, key := range config.Keys {
+		m.aimbotKeys = append(m.aimbotKeys, key.Code)
+		fmt.Printf("[AIMBOT] Key: %s (0x%02X)\n", key.Name, key.Code)
+	}
+
+	return nil
+}
+
+// SaveAimbotConfig salva a configuracao atual do aimbot
+func (m *Manager) SaveAimbotConfig(filename string) error {
+	config := AimbotConfig{
+		Enabled: m.aimbotEnabled,
+		Keys:    make([]AimbotKeyConfig, len(m.aimbotKeys)),
+	}
+
+	for i, code := range m.aimbotKeys {
+		config.Keys[i] = AimbotKeyConfig{
+			Name: fmt.Sprintf("Key%d", i+1),
+			Code: code,
+		}
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filename, data, 0644)
+}
+
+// isAimbotKeyPressed verifica se alguma tecla do aimbot esta pressionada
+func (m *Manager) isAimbotKeyPressed() bool {
+	for _, key := range m.aimbotKeys {
+		ret, _, _ := procGetAsyncKeyState.Call(uintptr(key))
+		if ret&0x8000 != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// aimbotLoop roda em goroutine separada com alta taxa de atualizacao
+func (m *Manager) aimbotLoop() {
+	m.aimbotRunning = true
+	defer func() { m.aimbotRunning = false }()
+
+	for m.running {
+		select {
+		case <-m.aimbotStopChan:
+			return
+		default:
+		}
+
+		// Taxa alta: ~500 FPS (2ms)
+		time.Sleep(2 * time.Millisecond)
+
+		// Aimbot ativa apenas quando tecla do config esta pressionada
+		if m.isAimbotKeyPressed() {
+			m.AimAtTarget()
+		}
+	}
+}
+
 // AimAtTarget move o cursor para a posicao do alvo
 func (m *Manager) AimAtTarget() bool {
-	if !m.enabled || m.lastTargetX <= 0 || m.lastTargetY <= 0 {
+	return m.AimAtTargetDebug(false)
+}
+
+// AimAtTargetDebug move o cursor com debug opcional
+func (m *Manager) AimAtTargetDebug(debug bool) bool {
+	targetID := m.readU32(targetBase + targetIDOffset)
+
+	// Verifica se tem target selecionado
+	if targetID == 0 {
+		if debug {
+			fmt.Println("[AIM] FAIL: No target (ID=0)")
+		}
 		return false
 	}
 
+	// Pega coordenadas do player target (ignora flag, usa coords diretamente)
+	targetX := m.readFloat32(targetBase + playerTargetPosX)
+	targetY := m.readFloat32(targetBase + playerTargetPosY)
+	targetZ := m.readFloat32(targetBase + playerTargetPosZ)
+
+	if targetX == 0 && targetY == 0 && targetZ == 0 {
+		if debug {
+			fmt.Println("[AIM] FAIL: Player coords are 0,0,0 (probably mob target)")
+		}
+		return false
+	}
+
+	// WorldToScreen (ordem: X, Z, Y)
+	screenX, screenY := m.WorldToScreen(targetX, targetZ, targetY)
+
+	// Convert to pixels
+	pixelX := int32(screenX * float32(m.screenW) / 100.0)
+	pixelY := int32(screenY * float32(m.screenH) / 100.0)
+
+	if pixelX <= 0 || pixelX >= m.screenW || pixelY <= 0 || pixelY >= m.screenH {
+		if debug {
+			fmt.Printf("[AIM] FAIL: Off screen (pixel: %d,%d)\n", pixelX, pixelY)
+		}
+		return false
+	}
+
+	if debug {
+		fmt.Printf("[AIM] OK: ID=0x%X coords=(%.1f,%.1f,%.1f) pixel=(%d,%d)\n",
+			targetID, targetX, targetY, targetZ, pixelX, pixelY)
+	}
+
 	// SetCursorPos usa coordenadas absolutas da tela
-	ret, _, _ := procSetCursorPos.Call(uintptr(m.lastTargetX), uintptr(m.lastTargetY))
+	ret, _, _ := procSetCursorPos.Call(uintptr(pixelX), uintptr(pixelY))
 	return ret != 0
+}
+
+// IsTargetPlayer retorna true se o target atual eh um player
+func (m *Manager) IsTargetPlayer() bool {
+	if !m.HasTarget() {
+		return false
+	}
+	flag := m.readU32(targetBase + targetTypeFlag)
+	return flag == 0
 }
 
 // GetTargetScreenPos retorna a posicao do alvo na tela
@@ -780,4 +1037,249 @@ func (m *Manager) GetTargetScreenPos() (int32, int32, bool) {
 		return 0, 0, false
 	}
 	return m.lastTargetX, m.lastTargetY, true
+}
+
+// ============================================================================
+// Target Memory Scanner/Debug
+// ============================================================================
+
+// TargetScanner monitora mudanças na região de memória do target
+type TargetScanner struct {
+	handle        uintptr
+	baseAddr      uintptr
+	scanSize      int
+	prevSnapshot  []byte
+	scanCount     int
+	debugFile     *os.File
+	scanning      bool
+}
+
+// NewTargetScanner cria um novo scanner de target
+func (m *Manager) NewTargetScanner() *TargetScanner {
+	return &TargetScanner{
+		handle:   m.processHandle,
+		baseAddr: targetBase,
+		scanSize: 0x800, // Scan 2KB ao redor do targetBase
+		scanning: false,
+	}
+}
+
+// StartScanning inicia o scan e cria arquivo de debug
+func (ts *TargetScanner) StartScanning() error {
+	filename := fmt.Sprintf("target_scan_%s.txt", time.Now().Format("2006-01-02_15-04-05"))
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("erro ao criar arquivo de debug: %v", err)
+	}
+	ts.debugFile = file
+	ts.scanning = true
+	ts.scanCount = 0
+
+	// Header do arquivo
+	ts.debugFile.WriteString("========================================\n")
+	ts.debugFile.WriteString("  TARGET MEMORY SCANNER DEBUG LOG\n")
+	ts.debugFile.WriteString(fmt.Sprintf("  Base: 0x%08X  Size: 0x%X\n", ts.baseAddr, ts.scanSize))
+	ts.debugFile.WriteString(fmt.Sprintf("  Started: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+	ts.debugFile.WriteString("========================================\n\n")
+
+	// Fazer snapshot inicial
+	ts.prevSnapshot = ts.readMemoryRegion()
+	ts.logSnapshot("INITIAL SNAPSHOT")
+
+	fmt.Printf("[SCANNER] Iniciado! Salvando em: %s\n", filename)
+	return nil
+}
+
+// StopScanning para o scan e fecha o arquivo
+func (ts *TargetScanner) StopScanning() {
+	if ts.debugFile != nil {
+		ts.debugFile.WriteString("\n========================================\n")
+		ts.debugFile.WriteString(fmt.Sprintf("  Scan finalizado: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+		ts.debugFile.WriteString(fmt.Sprintf("  Total de scans: %d\n", ts.scanCount))
+		ts.debugFile.WriteString("========================================\n")
+		ts.debugFile.Close()
+		ts.debugFile = nil
+	}
+	ts.scanning = false
+	fmt.Println("[SCANNER] Parado!")
+}
+
+// IsScanning retorna se está escaneando
+func (ts *TargetScanner) IsScanning() bool {
+	return ts.scanning
+}
+
+// readMemoryRegion lê a região de memória
+func (ts *TargetScanner) readMemoryRegion() []byte {
+	data := make([]byte, ts.scanSize)
+	var bytesRead uintptr
+
+	procReadProcessMemory.Call(
+		ts.handle,
+		ts.baseAddr,
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(ts.scanSize),
+		uintptr(unsafe.Pointer(&bytesRead)),
+	)
+
+	return data
+}
+
+// ScanForChanges detecta e loga mudanças
+func (ts *TargetScanner) ScanForChanges(label string) {
+	if !ts.scanning || ts.debugFile == nil {
+		return
+	}
+
+	ts.scanCount++
+	currentSnapshot := ts.readMemoryRegion()
+
+	// Detectar mudanças
+	changes := ts.compareSnapshots(ts.prevSnapshot, currentSnapshot)
+
+	if len(changes) > 0 {
+		ts.debugFile.WriteString(fmt.Sprintf("\n--- SCAN #%d: %s [%s] ---\n",
+			ts.scanCount, label, time.Now().Format("15:04:05.000")))
+		ts.debugFile.WriteString(fmt.Sprintf("Mudanças detectadas: %d\n\n", len(changes)))
+
+		for _, change := range changes {
+			ts.debugFile.WriteString(change)
+		}
+
+		// Log floats interessantes na região de coordenadas
+		ts.logInterestingFloats(currentSnapshot)
+
+		fmt.Printf("[SCANNER] Scan #%d: %d mudanças detectadas\n", ts.scanCount, len(changes))
+	}
+
+	ts.prevSnapshot = currentSnapshot
+}
+
+// compareSnapshots compara dois snapshots e retorna as diferenças
+func (ts *TargetScanner) compareSnapshots(prev, curr []byte) []string {
+	var changes []string
+
+	// Comparar em blocos de 4 bytes (DWORD)
+	for i := 0; i+4 <= len(prev) && i+4 <= len(curr); i += 4 {
+		prevVal := binary.LittleEndian.Uint32(prev[i : i+4])
+		currVal := binary.LittleEndian.Uint32(curr[i : i+4])
+
+		if prevVal != currVal {
+			addr := ts.baseAddr + uintptr(i)
+			prevFloat := math.Float32frombits(prevVal)
+			currFloat := math.Float32frombits(currVal)
+
+			// Verificar se parece ser float válido (coordenadas geralmente entre -100000 e 100000)
+			isValidFloat := (currFloat > -100000 && currFloat < 100000) &&
+				(currFloat != 0) && !math.IsNaN(float64(currFloat)) && !math.IsInf(float64(currFloat), 0)
+
+			change := fmt.Sprintf("  [0x%08X] +0x%03X: 0x%08X -> 0x%08X",
+				addr, i, prevVal, currVal)
+
+			if isValidFloat {
+				change += fmt.Sprintf("  (float: %.2f -> %.2f)", prevFloat, currFloat)
+			}
+			change += "\n"
+
+			changes = append(changes, change)
+		}
+	}
+
+	return changes
+}
+
+// logSnapshot loga um snapshot completo
+func (ts *TargetScanner) logSnapshot(label string) {
+	ts.debugFile.WriteString(fmt.Sprintf("\n=== %s ===\n", label))
+	ts.logInterestingFloats(ts.prevSnapshot)
+}
+
+// logInterestingFloats loga floats que parecem ser coordenadas
+func (ts *TargetScanner) logInterestingFloats(data []byte) {
+	ts.debugFile.WriteString("\nOffsets com floats interessantes (possiveis coordenadas):\n")
+
+	// Offsets conhecidos
+	knownOffsets := map[int]string{
+		0x320: "mobTargetX",
+		0x324: "mobTargetZ",
+		0x328: "mobTargetY",
+		0x6A4: "playerTargetX",
+		0x6A8: "playerTargetZ",
+		0x6AC: "playerTargetY",
+	}
+
+	// Logar offsets conhecidos
+	ts.debugFile.WriteString("\n  -- Offsets Conhecidos --\n")
+	for offset, name := range knownOffsets {
+		if offset+4 <= len(data) {
+			val := binary.LittleEndian.Uint32(data[offset : offset+4])
+			floatVal := math.Float32frombits(val)
+			ts.debugFile.WriteString(fmt.Sprintf("  +0x%03X %-15s: 0x%08X (%.2f)\n",
+				offset, name, val, floatVal))
+		}
+	}
+
+	// Procurar outros floats que parecem coordenadas
+	ts.debugFile.WriteString("\n  -- Outros Floats (range 100-50000) --\n")
+	count := 0
+	for i := 0; i+4 <= len(data) && count < 50; i += 4 {
+		val := binary.LittleEndian.Uint32(data[i : i+4])
+		floatVal := math.Float32frombits(val)
+
+		// Filtrar floats que parecem coordenadas (valores típicos de posição no jogo)
+		absVal := float32(math.Abs(float64(floatVal)))
+		if absVal > 100 && absVal < 50000 && !math.IsNaN(float64(floatVal)) {
+			// Pular offsets já conhecidos
+			_, known := knownOffsets[i]
+			if !known {
+				ts.debugFile.WriteString(fmt.Sprintf("  +0x%03X: 0x%08X (%.2f)\n",
+					i, val, floatVal))
+				count++
+			}
+		}
+	}
+
+	// Procurar possíveis flags/enums (valores pequenos 0-10)
+	ts.debugFile.WriteString("\n  -- Possiveis Flags (0-10) --\n")
+	count = 0
+	for i := 0; i+4 <= len(data) && count < 30; i += 4 {
+		val := binary.LittleEndian.Uint32(data[i : i+4])
+		if val > 0 && val <= 10 {
+			ts.debugFile.WriteString(fmt.Sprintf("  +0x%03X: %d\n", i, val))
+			count++
+		}
+	}
+}
+
+// DumpRegion faz um dump completo da região
+func (ts *TargetScanner) DumpRegion() {
+	if ts.debugFile == nil {
+		return
+	}
+
+	data := ts.readMemoryRegion()
+	ts.debugFile.WriteString("\n\n=== FULL MEMORY DUMP ===\n")
+	ts.debugFile.WriteString(fmt.Sprintf("Base: 0x%08X\n\n", ts.baseAddr))
+
+	for i := 0; i < len(data); i += 16 {
+		// Endereço
+		ts.debugFile.WriteString(fmt.Sprintf("%08X: ", uint32(ts.baseAddr)+uint32(i)))
+
+		// Hex bytes
+		for j := 0; j < 16 && i+j < len(data); j++ {
+			ts.debugFile.WriteString(fmt.Sprintf("%02X ", data[i+j]))
+		}
+
+		// ASCII
+		ts.debugFile.WriteString(" |")
+		for j := 0; j < 16 && i+j < len(data); j++ {
+			b := data[i+j]
+			if b >= 32 && b <= 126 {
+				ts.debugFile.WriteString(string(b))
+			} else {
+				ts.debugFile.WriteString(".")
+			}
+		}
+		ts.debugFile.WriteString("|\n")
+	}
 }

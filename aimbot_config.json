@@ -1,0 +1,14 @@
+{
+  "enabled": false,
+  "keys": [
+    {
+      "name": "T",
+      "code": 84
+    },
+    {
+      "name": "C",
+      "code": 67
+    }
+  ],
+  "note": "Codigos comuns: Mouse4=5, Mouse5=6, LShift=160, RShift=161, CapsLock=20, Ctrl=17, Alt=18, T=84, C=67, A-Z=65-90, 0-9=48-57"
+}

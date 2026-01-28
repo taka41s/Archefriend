@@ -48,6 +48,7 @@ type App struct {
 	skillMonitor         *skill.SkillMonitor
 	skillReactionManager *skill.ReactionManager
 	keybinds             *config.KeybindsConfig
+	targetScanner        *esp.TargetScanner
 
 	window            *gui.OverlayWindow
 	configWindow      *gui.ConfigWindow
@@ -123,6 +124,14 @@ func NewApp() (*App, error) {
 		fmt.Printf("[WARN] Falha ao criar ESP: %v\n", err)
 	} else {
 		app.espManager = espMgr
+		// Criar scanner de target para debug
+		app.targetScanner = espMgr.NewTargetScanner()
+
+		// Carregar configuracao do aimbot
+		if err := espMgr.LoadAimbotConfig("aimbot_config.json"); err != nil {
+			fmt.Printf("[AIMBOT] Config não encontrada, usando padrão (Mouse4, Mouse5)\n")
+			espMgr.SetAimbotKeys([]int{0x05, 0x06})
+		}
 	}
 
 	// Create Skill monitor (offset 0x569E1A para hook de skill success)
@@ -413,16 +422,6 @@ func (app *App) pollHotkeys() {
 				_ = style
 			}
 		},
-		0x2D: func() { // INSERT - Toggle Aimbot
-			if app.espManager != nil {
-				enabled := app.espManager.ToggleAimbot()
-				status := "OFF"
-				if enabled {
-					status = "ON"
-				}
-				fmt.Printf("[ESP] Aimbot: %s\n", status)
-			}
-		},
 		0x22: func() { // PAGE DOWN - Aim once
 			if app.espManager != nil && app.espManager.IsEnabled() {
 				if app.espManager.AimAtTarget() {
@@ -433,6 +432,28 @@ func (app *App) pollHotkeys() {
 		0x21: func() { // PAGE UP - Skill Config Window
 			if app.skillConfigWindow != nil {
 				app.skillConfigWindow.Toggle()
+			}
+		},
+		0x91: func() { // SCROLL LOCK - Start/Stop Target Scanner
+			if app.targetScanner != nil {
+				if app.targetScanner.IsScanning() {
+					app.targetScanner.StopScanning()
+				} else {
+					if err := app.targetScanner.StartScanning(); err != nil {
+						fmt.Printf("[SCANNER] Erro: %v\n", err)
+					}
+				}
+			}
+		},
+		0x13: func() { // PAUSE - Trigger scan (pressione quando mudar de target)
+			if app.targetScanner != nil && app.targetScanner.IsScanning() {
+				app.targetScanner.ScanForChanges("TARGET_CHANGE")
+			}
+		},
+		0x2E: func() { // DELETE - Dump full memory region
+			if app.targetScanner != nil && app.targetScanner.IsScanning() {
+				app.targetScanner.DumpRegion()
+				fmt.Println("[SCANNER] Memory dump salvo!")
 			}
 		},
 	}
@@ -523,18 +544,14 @@ func (app *App) getDisplayLines() []string {
 
 	espStatus := "OFF"
 	espStyle := ""
-	aimbotStatus := "OFF"
 	if app.espManager != nil && app.espManager.IsEnabled() {
 		espStatus = "ON"
 		espStyle = app.espManager.GetStyleName()
 	}
-	if app.espManager != nil && app.espManager.IsAimbotEnabled() {
-		aimbotStatus = "ON"
-	}
 
 	lines = append(lines, fmt.Sprintf("[F1] Loot:%s  [F2] Doodad:%s  [F3] Spam  [F4] AutoSpam:%s", lootStatus, doodadStatus, spamStatus))
 	lines = append(lines, fmt.Sprintf("[F5] Reload  [F6] Reactions:%s  [F10] AFK:%s", reactionStatus, afkStatus))
-	lines = append(lines, fmt.Sprintf("[F12] ESP:%s %s  [INS] Aim:%s  [PGDN] Aim", espStatus, espStyle, aimbotStatus))
+	lines = append(lines, fmt.Sprintf("[F12] ESP:%s %s  [PGDN] Aim", espStatus, espStyle))
 	lines = append(lines, "[F7] Config  [F8] Buffs  [F9] Quick  [PGUP] Skills  [END] Hide")
 	lines = append(lines, fmt.Sprintf("Quick:%s (%s)", quickStatus, quickPreset))
 
@@ -636,6 +653,13 @@ func (app *App) printDiagnostics() {
 		}
 	}
 
+	if app.espManager != nil {
+		fmt.Printf("\n[ESP TARGET DEBUG]\n")
+		app.espManager.DebugTargetInfo()
+		fmt.Printf("\n[AIMBOT DEBUG]\n")
+		app.espManager.AimAtTargetDebug(true)
+	}
+
 	fmt.Println("\n════════════════════════════════════════")
 	fmt.Println("Press F11 again to refresh.")
 	fmt.Println("════════════════════════════════════════\n")
@@ -656,6 +680,9 @@ func (app *App) Close() {
 	if app.buffInjector != nil {
 		app.buffInjector.StopFreezeLoop()
 	}
+	if app.targetScanner != nil && app.targetScanner.IsScanning() {
+		app.targetScanner.StopScanning()
+	}
 	if app.espManager != nil {
 		app.espManager.Close()
 	}
@@ -671,14 +698,16 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	fmt.Println("╔═══════════════════════════════════════╗")
-	fmt.Println("║      ARCHEFRIEND OVERLAY v3.4         ║")
+	fmt.Println("║      ARCHEFRIEND OVERLAY v3.5         ║")
 	fmt.Println("╠═══════════════════════════════════════╣")
 	fmt.Println("║  F1: Loot | F2: Doodad | F3: Spam    ║")
 	fmt.Println("║  F4: Auto | F5: Reload | F6: React   ║")
 	fmt.Println("║  F7: Config | F8: Buffs | F9: Quick  ║")
 	fmt.Println("║  F10: AFK | F11: Diag | F12: ESP     ║")
-	fmt.Println("║  INS: Aimbot | PGDN: Aim | HOME: Sty ║")
-	fmt.Println("║  PGUP: Skill Config | END: Hide      ║")
+	fmt.Println("║  PGDN: Aim | HOME: Style | END: Hide ║")
+	fmt.Println("║  PGUP: Skill Config                  ║")
+	fmt.Println("╠═══════════════════════════════════════╣")
+	fmt.Println("║  Aimbot: Config keys (aimbot_config) ║")
 	fmt.Println("╚═══════════════════════════════════════╝")
 	fmt.Println()
 
