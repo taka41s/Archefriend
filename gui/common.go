@@ -30,6 +30,7 @@ var (
 	procBeginPaint                 = user32.NewProc("BeginPaint")
 	procEndPaint                   = user32.NewProc("EndPaint")
 	procInvalidateRect             = user32.NewProc("InvalidateRect")
+	procRedrawWindow               = user32.NewProc("RedrawWindow")
 	procSendMessage                = user32.NewProc("SendMessageW")
 	procSetWindowPos               = user32.NewProc("SetWindowPos")
 	procDestroyWindow              = user32.NewProc("DestroyWindow")
@@ -39,14 +40,18 @@ var (
 	procEnableWindow               = user32.NewProc("EnableWindow")
 
 	// GDI
-	procCreateFontIndirect = gdi32.NewProc("CreateFontIndirectW")
-	procSelectObject       = gdi32.NewProc("SelectObject")
-	procSetTextColor       = gdi32.NewProc("SetTextColor")
-	procSetBkMode          = gdi32.NewProc("SetBkMode")
-	procTextOut            = gdi32.NewProc("TextOutW")
-	procDeleteObject       = gdi32.NewProc("DeleteObject")
-	procCreateSolidBrush   = gdi32.NewProc("CreateSolidBrush")
-	procFillRect           = user32.NewProc("FillRect")
+	procCreateFontIndirect   = gdi32.NewProc("CreateFontIndirectW")
+	procSelectObject         = gdi32.NewProc("SelectObject")
+	procSetTextColor         = gdi32.NewProc("SetTextColor")
+	procSetBkMode            = gdi32.NewProc("SetBkMode")
+	procTextOut              = gdi32.NewProc("TextOutW")
+	procDeleteObject         = gdi32.NewProc("DeleteObject")
+	procCreateSolidBrush     = gdi32.NewProc("CreateSolidBrush")
+	procFillRect             = user32.NewProc("FillRect")
+	procCreateCompatibleDC   = gdi32.NewProc("CreateCompatibleDC")
+	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
+	procDeleteDC             = gdi32.NewProc("DeleteDC")
+	procBitBlt               = gdi32.NewProc("BitBlt")
 
 	// Kernel
 	procGetModuleHandle = kernel32.NewProc("GetModuleHandleW")
@@ -90,6 +95,14 @@ const (
 	// Other
 	TRANSPARENT  = 1
 	COLOR_WINDOW = 5
+
+	// RedrawWindow flags
+	RDW_INVALIDATE = 0x0001
+	RDW_ERASE      = 0x0004
+	RDW_UPDATENOW  = 0x0100
+
+	// BitBlt raster operations
+	SRCCOPY = 0x00CC0020
 
 	// Edit control styles
 	ES_LEFT       = 0x0000
