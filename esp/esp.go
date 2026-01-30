@@ -1005,6 +1005,10 @@ func (m *Manager) AimAtTargetDebug(debug bool) bool {
 	pixelX := int32(screenX * float32(m.screenW) / 100.0)
 	pixelY := int32(screenY * float32(m.screenH) / 100.0)
 
+	// Ajuste para mirar no centro do personagem (em pixels 2D, após projeção)
+	// Subtrai pixels para mirar mais alto (Y cresce para baixo na tela)
+	pixelY -= 15
+
 	if pixelX <= 0 || pixelX >= m.screenW || pixelY <= 0 || pixelY >= m.screenH {
 		if debug {
 			fmt.Printf("[AIM] FAIL: Off screen (pixel: %d,%d)\n", pixelX, pixelY)

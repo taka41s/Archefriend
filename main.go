@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -34,6 +35,8 @@ type App struct {
 	x2game    uintptr
 	connected bool
 	mu        sync.RWMutex
+	pid       uint32 // PID do ArcheAge
+	gameHwnd  uintptr // Handle da janela do ArcheAge
 
 	lootBypass      *loot.Bypass
 	inputManager    *input.Manager
@@ -54,6 +57,7 @@ type App struct {
 	configWindow      *gui.ConfigWindow
 	buffWindow        *gui.BuffWindow
 	skillConfigWindow *gui.SkillConfigWindow
+	autospamWindow    *gui.AutoSpamWindow
 	visible           bool
 	keyStates    map[int]bool
 	frameCount   int
@@ -96,10 +100,23 @@ func NewApp() (*App, error) {
 
 	app.handle = handle
 	app.x2game = x2game
+	app.pid = pid
 	app.connected = true
+
+	// Encontrar janela do ArcheAge usando o PID
+	app.gameHwnd = findWindowByPID(pid)
 
 	app.lootBypass = loot.NewBypass(handle, x2game)
 	app.inputManager = input.NewManager()
+
+	// Configurar inputManager para enviar para a janela do ArcheAge
+	app.inputManager.SetGameWindow(app.gameHwnd)
+	// Configurar teclas padrão: V e SHIFT+F
+	app.inputManager.SetKeys([][]uint16{
+		{input.VK_V},
+		{input.VK_LSHIFT, input.VK_F},
+	})
+
 	app.afkMonitor = afk.NewMonitor(10)
 	app.afkMonitor.OnStateChange = func(isAFK bool) {
 		if isAFK {
@@ -209,6 +226,11 @@ func NewApp() (*App, error) {
 		app.skillConfigWindow = skillConfigWindow
 	}
 
+	autospamWindow, err := gui.NewAutoSpamWindow(app.inputManager)
+	if err == nil {
+		app.autospamWindow = autospamWindow
+	}
+
 	// Setup reaction callbacks
 	app.buffMonitor.OnBuffGained = func(buff monitor.BuffInfo) {
 		app.reactionManager.OnBuffGained(buff.ID)
@@ -307,6 +329,13 @@ func (app *App) monitorLoop() {
 					app.skillMonitor.Update()
 				}
 
+				// Update target monitor
+				if app.targetMonitor != nil {
+					// Obter posição do player para calcular distância
+					player := entity.GetLocalPlayer(app.handle, app.x2game)
+					app.targetMonitor.Update(player.PosX, player.PosY, player.PosZ)
+				}
+
 				if app.buffInjector != nil {
 					buffListAddr := app.buffMonitor.GetBuffListAddr(playerAddr)
 					app.buffInjector.SetBuffListAddr(buffListAddr)
@@ -400,6 +429,11 @@ func (app *App) pollHotkeys() {
 		0x79: func() { // F10
 			if app.afkMonitor != nil {
 				app.afkMonitor.Toggle()
+			}
+		},
+		0x2D: func() { // INSERT - AutoSpam Config
+			if app.autospamWindow != nil {
+				app.autospamWindow.Toggle()
 			}
 		},
 		0x7A: func() { // F11
@@ -570,6 +604,12 @@ func (app *App) printDiagnostics() {
 	connected := app.connected
 	app.mu.RUnlock()
 
+	// Debug HP offsets
+	if app.targetMonitor != nil {
+		fmt.Println("\n[SCANNING TARGET HP OFFSETS...]")
+		app.targetMonitor.DebugScanHP()
+	}
+
 	fmt.Printf("\n[CONNECTION]\n")
 	fmt.Printf("  Connected: %v\n", connected)
 	fmt.Printf("  Handle: 0x%X\n", app.handle)
@@ -663,6 +703,45 @@ func (app *App) printDiagnostics() {
 	fmt.Println("\n════════════════════════════════════════")
 	fmt.Println("Press F11 again to refresh.")
 	fmt.Println("════════════════════════════════════════\n")
+}
+
+// findWindowByPID encontra a janela principal de um processo pelo PID
+func findWindowByPID(targetPID uint32) uintptr {
+	user32 := windows.NewLazyDLL("user32.dll")
+	procEnumWindows := user32.NewProc("EnumWindows")
+	procGetWindowThreadProcessId := user32.NewProc("GetWindowThreadProcessId")
+	procIsWindowVisible := user32.NewProc("IsWindowVisible")
+
+	var foundHwnd uintptr
+
+	// Callback para EnumWindows
+	callback := func(hwnd uintptr, lParam uintptr) uintptr {
+		// Verificar se a janela é visível
+		visible, _, _ := procIsWindowVisible.Call(hwnd)
+		if visible == 0 {
+			return 1 // Continuar enumeração
+		}
+
+		// Obter PID da janela
+		var windowPID uint32
+		procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&windowPID)))
+
+		// Se for o PID do ArcheAge, salvar e parar
+		if windowPID == targetPID {
+			foundHwnd = hwnd
+			return 0 // Parar enumeração
+		}
+
+		return 1 // Continuar enumeração
+	}
+
+	// Enumerar todas as janelas
+	procEnumWindows.Call(
+		windows.NewCallback(callback),
+		0,
+	)
+
+	return foundHwnd
 }
 
 func (app *App) Close() {

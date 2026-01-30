@@ -3,6 +3,7 @@ package target
 import (
 	"archefriend/config"
 	"archefriend/memory"
+	"fmt"
 	"math"
 
 	"golang.org/x/sys/windows"
@@ -265,4 +266,64 @@ func (m *Monitor) GetManaPercent() float32 {
 		return 0
 	}
 	return float32(m.Target.Mana) / float32(m.Target.MaxMana)
+}
+
+// GetTargetID retorna o ID do target atual
+func (m *Monitor) GetTargetID() uint32 {
+	if !m.Target.Valid {
+		return 0
+	}
+	return m.Target.ID
+}
+
+// GetTargetHP retorna o HP atual e máximo do target
+func (m *Monitor) GetTargetHP() (int32, int32) {
+	if !m.Target.Valid {
+		return -1, -1
+	}
+	return int32(m.Target.HP), int32(m.Target.MaxHP)
+}
+
+// DebugScanHP escaneia diferentes offsets ao redor de 0x300-0x350 procurando por HP
+func (m *Monitor) DebugScanHP() {
+	fmt.Printf("\n[DEBUG-HP] ========== TARGET DEBUG ==========\n")
+	fmt.Printf("[DEBUG-HP] PTR_ENEMY_TARGET = x2game+0x%X\n", config.PTR_ENEMY_TARGET)
+
+	ptrValue := memory.ReadU32(m.handle, m.x2game+config.PTR_ENEMY_TARGET)
+	fmt.Printf("[DEBUG-HP] Valor do ponteiro: 0x%X\n", ptrValue)
+
+	targetBase := m.GetTargetBase()
+	fmt.Printf("[DEBUG-HP] Target base: 0x%X\n", targetBase)
+
+	if targetBase == 0 {
+		fmt.Println("[DEBUG-HP] ❌ Target base é 0! Nenhum target detectado ou ponteiro incorreto.")
+		return
+	}
+
+	base := uintptr(targetBase)
+	fmt.Printf("\n[DEBUG-HP] ✓ Target encontrado! Escaneando offsets...\n")
+	fmt.Println("[DEBUG-HP] Offset | Valor (Decimal) | Valor (Hex)")
+	fmt.Println("[DEBUG-HP] -------+----------------+-------------")
+
+	// Escanear de 0x000 até 0x400 (range maior)
+	for offset := uint32(0x000); offset <= 0x400; offset += 4 {
+		val := memory.ReadU32(m.handle, base+uintptr(offset))
+		// Mostrar valores que parecem HP/MaxHP (entre 1 e 1.000.000)
+		if val > 0 && val < 1000000 {
+			marker := ""
+			if offset == config.OFF_TGT_HP {
+				marker = " <- HP ATUAL (configurado)"
+			} else if offset == config.OFF_TGT_MAXHP {
+				marker = " <- HP MAX (configurado)"
+			}
+			fmt.Printf("[DEBUG-HP] 0x%03X  | %10d      | 0x%08X%s\n", offset, val, val, marker)
+		}
+	}
+
+	fmt.Printf("\n[DEBUG-HP] Offsets atuais configurados:\n")
+	fmt.Printf("[DEBUG-HP] OFF_TGT_HP     = 0x%X (valor lido: %d)\n", config.OFF_TGT_HP, m.Target.HP)
+	fmt.Printf("[DEBUG-HP] OFF_TGT_MAXHP  = 0x%X (valor lido: %d)\n", config.OFF_TGT_MAXHP, m.Target.MaxHP)
+	fmt.Printf("[DEBUG-HP] Target.Valid   = %v\n", m.Target.Valid)
+	fmt.Printf("[DEBUG-HP] Target.ID      = %d\n", m.Target.ID)
+	fmt.Println("[DEBUG-HP] ===================================\n")
 }

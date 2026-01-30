@@ -6,6 +6,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -22,15 +24,15 @@ const (
 
 // Virtual Key Codes - Modificadores
 const (
-	VK_SHIFT   = 0x10
-	VK_CONTROL = 0x11
-	VK_ALT     = 0x12
-	VK_LSHIFT  = 0xA0
-	VK_RSHIFT  = 0xA1
+	VK_SHIFT    = 0x10
+	VK_CONTROL  = 0x11
+	VK_ALT      = 0x12
+	VK_LSHIFT   = 0xA0
+	VK_RSHIFT   = 0xA1
 	VK_LCONTROL = 0xA2
 	VK_RCONTROL = 0xA3
-	VK_LMENU   = 0xA4 // Left ALT
-	VK_RMENU   = 0xA5 // Right ALT
+	VK_LALT     = 0xA4
+	VK_RALT     = 0xA5
 )
 
 // Virtual Key Codes - Letras
@@ -269,8 +271,8 @@ func ParseKeyString(keyStr string) ([]uint16, error) {
 		"LCTRL":    VK_LCONTROL,
 		"RCTRL":    VK_RCONTROL,
 		"CTRL":     VK_CONTROL,
-		"LALT":     VK_LMENU,
-		"RALT":     VK_RMENU,
+		"LALT":     VK_LALT,
+		"RALT":     VK_RALT,
 		"ALT":      VK_ALT,
 		"LCONTROL": VK_LCONTROL,
 		"RCONTROL": VK_RCONTROL,
@@ -433,26 +435,35 @@ func ParseKeySequence(sequenceStr string) ([][]uint16, error) {
 
 // Manager gerencia o envio automático de teclas
 type Manager struct {
-	enabled      bool
-	key          uint16
-	interval     time.Duration
-	stopChan     chan bool
-	autoSpamming bool
+	enabled       bool
+	keys          [][]uint16      // Lista de combos de teclas (ex: [[VK_V], [VK_SHIFT, VK_F]])
+	interval      time.Duration
+	stopChan      chan bool
+	autoSpamming  bool
+	gameHwnd      uintptr         // Handle da janela do jogo
+	sendToWindow  bool            // Se true, usa PostMessage; se false, usa SendInput
 }
 
 // NewManager cria um novo input manager
 func NewManager() *Manager {
 	return &Manager{
-		enabled:  false,
-		key:      VK_V,
-		interval: 100 * time.Millisecond,
-		stopChan: make(chan bool),
+		enabled:      false,
+		keys:         [][]uint16{{VK_V}}, // Padrão: apenas V
+		interval:     120 * time.Millisecond,
+		stopChan:     make(chan bool),
+		sendToWindow: false,
 	}
 }
 
-// SetKey define a tecla a ser enviada
-func (m *Manager) SetKey(vk uint16) {
-	m.key = vk
+// SetKeys define a lista de teclas/combos a serem enviados
+func (m *Manager) SetKeys(keys [][]uint16) {
+	m.keys = keys
+}
+
+// SetGameWindow define a janela do jogo para enviar inputs via PostMessage
+func (m *Manager) SetGameWindow(hwnd uintptr) {
+	m.gameHwnd = hwnd
+	m.sendToWindow = (hwnd != 0)
 }
 
 // SetInterval define o intervalo entre envios
@@ -460,20 +471,81 @@ func (m *Manager) SetInterval(interval time.Duration) {
 	m.interval = interval
 }
 
-// SendSingle envia a tecla uma vez
-func (m *Manager) SendSingle() error {
-	fmt.Printf("[INPUT] Enviando tecla 0x%X\n", m.key)
-	return SendKey(m.key)
+// GetKeys retorna a lista de teclas configuradas
+func (m *Manager) GetKeys() [][]uint16 {
+	return m.keys
 }
 
-// StartAutoSpam inicia o envio automático da tecla
+// SendSingle envia todas as teclas configuradas uma vez
+func (m *Manager) SendSingle() error {
+	for _, combo := range m.keys {
+		if m.sendToWindow {
+			m.sendComboToWindow(combo)
+		} else {
+			SendKeyCombo(combo)
+		}
+	}
+	return nil
+}
+
+// sendComboToWindow envia um combo de teclas para a janela do jogo usando PostMessage
+func (m *Manager) sendComboToWindow(keys []uint16) {
+	if m.gameHwnd == 0 {
+		return
+	}
+
+	const (
+		WM_KEYDOWN = 0x0100
+		WM_KEYUP   = 0x0101
+	)
+
+	user32 := windows.NewLazyDLL("user32.dll")
+	procPostMessage := user32.NewProc("PostMessageW")
+
+	// Enviar todas as teclas DOWN
+	for _, vk := range keys {
+		lParam := uintptr(0x00000001) // Repeat count = 1
+		if vk == VK_SHIFT || vk == VK_LSHIFT {
+			lParam = 0x002A0001
+		} else if vk == VK_CONTROL || vk == VK_LCONTROL {
+			lParam = 0x001D0001
+		} else if vk == VK_ALT || vk == VK_LALT {
+			lParam = 0x00380001
+		} else if vk == VK_F {
+			lParam = 0x00210001
+		}
+		procPostMessage.Call(m.gameHwnd, WM_KEYDOWN, uintptr(vk), lParam)
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+
+	// Enviar todas as teclas UP (ordem reversa)
+	for i := len(keys) - 1; i >= 0; i-- {
+		vk := keys[i]
+		lParam := uintptr(0xC0000001)
+		if vk == VK_SHIFT || vk == VK_LSHIFT {
+			lParam = 0xC02A0001
+		} else if vk == VK_CONTROL || vk == VK_LCONTROL {
+			lParam = 0xC01D0001
+		} else if vk == VK_ALT || vk == VK_LALT {
+			lParam = 0xC0380001
+		} else if vk == VK_F {
+			lParam = 0xC0210001
+		}
+		procPostMessage.Call(m.gameHwnd, WM_KEYUP, uintptr(vk), lParam)
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// StartAutoSpam inicia o envio automático das teclas configuradas
 func (m *Manager) StartAutoSpam() {
 	if m.autoSpamming {
 		return
 	}
 
 	m.autoSpamming = true
-	fmt.Printf("[INPUT] Auto-spam iniciado - Tecla: 0x%X, Intervalo: %v\n", m.key, m.interval)
+	fmt.Printf("[INPUT] Auto-spam iniciado - %d combos, Intervalo: %v\n", len(m.keys), m.interval)
 
 	go func() {
 		ticker := time.NewTicker(m.interval)
@@ -484,7 +556,13 @@ func (m *Manager) StartAutoSpam() {
 			case <-m.stopChan:
 				return
 			case <-ticker.C:
-				SendKey(m.key)
+				for _, combo := range m.keys {
+					if m.sendToWindow {
+						m.sendComboToWindow(combo)
+					} else {
+						SendKeyCombo(combo)
+					}
+				}
 			}
 		}
 	}()
@@ -570,7 +648,7 @@ func isModifier(vk uint16) bool {
 	return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_ALT ||
 		vk == VK_LSHIFT || vk == VK_RSHIFT ||
 		vk == VK_LCONTROL || vk == VK_RCONTROL ||
-		vk == VK_LMENU || vk == VK_RMENU
+		vk == VK_LALT || vk == VK_RALT
 }
 
 // SpamKey envia uma combinação de teclas múltiplas vezes

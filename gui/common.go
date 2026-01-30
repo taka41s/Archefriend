@@ -38,6 +38,7 @@ var (
 	procGetWindowText              = user32.NewProc("GetWindowTextW")
 	procGetWindowTextLength        = user32.NewProc("GetWindowTextLengthW")
 	procEnableWindow               = user32.NewProc("EnableWindow")
+	procSetForegroundWindow        = user32.NewProc("SetForegroundWindow")
 
 	// GDI
 	procCreateFontIndirect   = gdi32.NewProc("CreateFontIndirectW")

@@ -3,9 +3,10 @@ package config
 import "time"
 
 const (
-	PTR_GAME_CLIENT  uintptr = 0xE9DC68
-	PTR_LOCALPLAYER  uintptr = 0xE9DC54
-	PTR_ENEMY_TARGET uintptr = 0x19EBF4
+	PTR_GAME_CLIENT     uintptr = 0xE9DC68
+	PTR_LOCALPLAYER     uintptr = 0xE9DC54
+	PTR_ENEMY_TARGET    uintptr = 0x19EBF4 // Entity do target (ID, posição, etc)
+	PTR_TARGET_UI       uintptr = 0x0      // UI do target (HP correto) - precisa ser encontrado
 
 	OFF_PLAYER_ENTITY  uint32 = 0x10
 	OFF_GC_LOCALPLAYER uint32 = 0xFC
@@ -42,12 +43,19 @@ const (
 
 	OFF_TARGET_ENTITY_ID uint32 = 0x73D0
 
+	// Offsets da Entity do target (para ID, posição, etc)
 	OFF_TGT_ID      uint32 = 0x008
 	OFF_TGT_TYPE    uint32 = 0x020
 	OFF_TGT_LEVEL   uint32 = 0x024
 	OFF_TGT_POS_X   uint32 = 0x320
 	OFF_TGT_POS_Z   uint32 = 0x324
 	OFF_TGT_POS_Y   uint32 = 0x328
+
+	// Offsets da UI do target (para HP correto)
+	OFF_TGT_UI_HP      uint32 = 0x318  // HP atual na UI
+	OFF_TGT_UI_MAXHP   uint32 = 0x314  // HP máximo na UI
+
+	// Offsets antigos (entity - podem estar incorretos para HP)
 	OFF_TGT_HP      uint32 = 0x318
 	OFF_TGT_MAXHP   uint32 = 0x314
 	OFF_TGT_MANA    uint32 = 0xD50
