@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -27,6 +28,7 @@ var (
 	procWriteProcessMemory       = kernel32.NewProc("WriteProcessMemory")
 	procVirtualAllocEx           = kernel32.NewProc("VirtualAllocEx")
 	procVirtualFreeEx            = kernel32.NewProc("VirtualFreeEx")
+	procVirtualProtectEx         = kernel32.NewProc("VirtualProtectEx")
 	procCreateRemoteThread       = kernel32.NewProc("CreateRemoteThread")
 	procWaitForSingleObject      = kernel32.NewProc("WaitForSingleObject")
 
@@ -34,6 +36,7 @@ var (
 	procCreateWindowExW            = user32.NewProc("CreateWindowExW")
 	procDefWindowProcW             = user32.NewProc("DefWindowProcW")
 	procShowWindow                 = user32.NewProc("ShowWindow")
+	procIsWindowVisible            = user32.NewProc("IsWindowVisible")
 	procUpdateWindow               = user32.NewProc("UpdateWindow")
 	procPeekMessageW               = user32.NewProc("PeekMessageW")
 	procTranslateMessage           = user32.NewProc("TranslateMessage")
@@ -49,6 +52,10 @@ var (
 	procDestroyWindow              = user32.NewProc("DestroyWindow")
 	procSetCursorPos               = user32.NewProc("SetCursorPos")
 	procGetAsyncKeyState           = user32.NewProc("GetAsyncKeyState")
+	procGetCursorPos               = user32.NewProc("GetCursorPos")
+	procScreenToClient             = user32.NewProc("ScreenToClient")
+	procSetWindowLongW             = user32.NewProc("SetWindowLongW")
+	procGetWindowLongW             = user32.NewProc("GetWindowLongW")
 
 	procCreatePen          = gdi32.NewProc("CreatePen")
 	procSelectObject       = gdi32.NewProc("SelectObject")
@@ -86,12 +93,16 @@ const (
 	WS_EX_TRANSPARENT = 0x00000020
 	WS_EX_TOPMOST     = 0x00000008
 	WS_EX_TOOLWINDOW  = 0x00000080
+	WS_EX_NOACTIVATE  = 0x08000000
 	WS_POPUP          = 0x80000000
 
 	LWA_COLORKEY = 0x00000001
 	SW_SHOW      = 5
 	SW_HIDE      = 0
 	PM_REMOVE    = 0x0001
+
+	WM_LBUTTONDOWN = 0x0201
+	WM_LBUTTONUP   = 0x0202
 
 	TRANSPARENT_COLOR = 0x00FF00FF
 
@@ -102,7 +113,7 @@ const (
 	SRCCOPY     = 0x00CC0020
 )
 
-// Cores para distância
+// Distance colors
 const (
 	COLOR_BLACK  = 0x00000000
 	COLOR_WHITE  = 0x00FFFFFF
@@ -122,13 +133,13 @@ const (
 	playerTargetPosY = 0x6AC
 	playerTargetPosZ = 0x6A8
 
-	// Flag de tipo de target: 1 = mob/NPC, 0 = player
+	// Target type flag: 1 = mob/NPC, 0 = player
 	targetTypeFlag = 0x028
 
-	// ID do target atual (0 = sem target, != 0 = target selecionado)
+	// Current target ID (0 = no target, != 0 = target selected)
 	targetIDOffset = 0x008
 
-	// Target pointer (para verificar se tem target selecionado)
+	// Target pointer (to check if target is selected)
 	PTR_ENEMY_TARGET uintptr = 0x19EBF4
 
 	INPUT_X_OFFSET  = 0x100
@@ -172,8 +183,9 @@ type MSG struct {
 
 type RECT struct{ Left, Top, Right, Bottom int32 }
 type MARGINS struct{ Left, Right, Top, Bottom int32 }
+type POINT struct{ X, Y int32 }
 
-// ESPStyle define o estilo visual do ESP
+// ESPStyle defines ESP visual style
 type ESPStyle int
 
 const (
@@ -216,13 +228,54 @@ type Manager struct {
 	CornerLength int32
 	BoxThickness int32
 
+	// All Entities ESP (separate module)
+	allEntitiesManager *AllEntitiesManager
+
+	// Mutex for WorldToScreen (prevents race condition between ESP and Aimbot)
+	wtsMutex sync.Mutex
+
 	// Aimbot
 	aimbotEnabled   bool
 	aimbotRunning   bool
 	aimbotStopChan  chan bool
-	aimbotKeys      []int // Teclas que ativam o aimbot quando pressionadas
+	aimbotKeys      []int // Keys that activate aimbot when pressed
 	lastTargetX     int32
 	lastTargetY     int32
+
+	// Checkbox UI
+	checkboxPlayerX int32
+	checkboxPlayerY int32
+	checkboxNPCX    int32
+	checkboxNPCY    int32
+	checkboxMateX   int32
+	checkboxMateY   int32
+	checkboxSize    int32
+	uiVisible       bool
+	lastMouseState  bool
+
+	// Range filter UI
+	rangeDecBtnX   int32
+	rangeDecBtnY   int32
+	rangeIncBtnX   int32
+	rangeIncBtnY   int32
+	rangeBtnSize   int32
+}
+
+// EntityInfo stores entity information
+type EntityInfo struct {
+	Address  uint32
+	VTable   uint32
+	EntityID uint32
+	Name     string
+	PosX     float32
+	PosY     float32
+	PosZ     float32
+	HP       uint32
+	MaxHP    uint32
+	IsPlayer bool
+	IsNPC    bool
+	IsMate   bool
+	Distance float32
 }
 
 func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
@@ -245,19 +298,26 @@ func enumWindowsCallback(hwnd uintptr, lParam uintptr) uintptr {
 	return 1
 }
 
-// NewManager cria um novo ESP manager
+// NewManager creates a new ESP manager
 func NewManager(processHandle uintptr, pid uint32, x2game uintptr) (*Manager, error) {
 	m := &Manager{
 		processHandle:  processHandle,
 		x2game:         x2game,
-		enabled:        false,
+		enabled:        true,  // Target ESP enabled by default
 		running:        false,
 		stopChan:       make(chan bool),
 		aimbotStopChan: make(chan bool),
 		Style:          StyleCorners,
 		CornerLength:   12,
 		BoxThickness:   2,
+		checkboxSize:   16,
+		uiVisible:      true,
+		lastMouseState: false,
+		rangeBtnSize:   20,
 	}
+
+	// Create separate module for All Entities ESP
+	m.allEntitiesManager = NewAllEntitiesManager(processHandle, x2game, m)
 
 	// Allocate shellcode
 	if err := m.allocateShellcode(); err != nil {
@@ -279,7 +339,7 @@ func NewManager(processHandle uintptr, pid uint32, x2game uintptr) (*Manager, er
 	m.screenW = gameRect.Right - gameRect.Left
 	m.screenH = gameRect.Bottom - gameRect.Top
 
-	// Create overlay
+	// Create overlay with WS_EX_NOACTIVATE to prevent focus stealing
 	className := syscall.StringToUTF16Ptr("ArcheFriendESP")
 	wc := WNDCLASSEXW{
 		Size:      uint32(unsafe.Sizeof(WNDCLASSEXW{})),
@@ -289,7 +349,7 @@ func NewManager(processHandle uintptr, pid uint32, x2game uintptr) (*Manager, er
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 
 	hwnd, _, _ := procCreateWindowExW.Call(
-		WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
+		WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
 		uintptr(unsafe.Pointer(className)),
 		0,
 		WS_POPUP,
@@ -362,6 +422,10 @@ func (m *Manager) allocateShellcode() error {
 // Close libera recursos
 func (m *Manager) Close() {
 	m.Stop()
+	// Stop All Entities ESP if running
+	if m.allEntitiesManager != nil {
+		m.allEntitiesManager.Stop()
+	}
 	if m.font != 0 {
 		procDeleteObject.Call(m.font)
 	}
@@ -407,7 +471,7 @@ func (m *Manager) writeFloat32(addr uintptr, val float32) {
 	procWriteProcessMemory.Call(m.processHandle, addr, uintptr(unsafe.Pointer(&buf[0])), 4, uintptr(unsafe.Pointer(&written)))
 }
 
-// GetPlayerPosition retorna a posicao do jogador local
+// GetPlayerPosition returns local player position
 func (m *Manager) GetPlayerPosition() (float32, float32, float32, bool) {
 	ptr1 := m.readU32(m.x2game + PTR_LOCALPLAYER)
 	if ptr1 == 0 {
@@ -426,8 +490,13 @@ func (m *Manager) GetPlayerPosition() (float32, float32, float32, bool) {
 	return x, y, z, true
 }
 
-// WorldToScreen converte coordenadas do mundo para tela
-func (m *Manager) WorldToScreen(x, y, z float32) (float32, float32) {
+// WorldToScreen converts world coordinates to screen
+// Returns screenX, screenY (percentage 0-100) and screenZ (depth, >= 1.0 = behind camera)
+func (m *Manager) WorldToScreen(x, y, z float32) (float32, float32, float32) {
+	// Mutex to prevent race condition between ESP and Aimbot
+	m.wtsMutex.Lock()
+	defer m.wtsMutex.Unlock()
+
 	m.writeFloat32(m.shellcodeBase+INPUT_X_OFFSET, x)
 	m.writeFloat32(m.shellcodeBase+INPUT_Y_OFFSET, y)
 	m.writeFloat32(m.shellcodeBase+INPUT_Z_OFFSET, z)
@@ -435,30 +504,31 @@ func (m *Manager) WorldToScreen(x, y, z float32) (float32, float32) {
 	var threadID uint32
 	th, _, _ := procCreateRemoteThread.Call(m.processHandle, 0, 0, m.shellcodeBase, 0, 0, uintptr(unsafe.Pointer(&threadID)))
 	if th == 0 {
-		return 0, 0
+		return 0, 0, -1
 	}
 	procWaitForSingleObject.Call(th, 5000)
 	procCloseHandle.Call(th)
 
 	screenX := m.readFloat32(m.shellcodeBase + OUTPUT_X_OFFSET)
 	screenY := m.readFloat32(m.shellcodeBase + OUTPUT_Y_OFFSET)
-	return screenX, screenY
+	screenZ := m.readFloat32(m.shellcodeBase + OUTPUT_Z_OFFSET)
+	return screenX, screenY, screenZ
 }
 
-// HasTarget verifica se tem um target selecionado
+// HasTarget checks if a target is selected
 func (m *Manager) HasTarget() bool {
 	targetPtr := m.readU32(m.x2game + PTR_ENEMY_TARGET)
 	return targetPtr != 0
 }
 
-// GetTarget retorna a posicao do alvo atual (apenas player targets)
+// GetTarget returns current target position (player targets only)
 func (m *Manager) GetTarget() (float32, float32, float32, bool) {
-	// Verifica se tem target usando o ID
+	// Check if has target using ID
 	if !m.HasTargetByID() {
 		return 0, 0, 0, false
 	}
 
-	// Player target coords (se for mob, essas coords estarao zeradas)
+	// Player target coords (if mob, these coords will be zero)
 	x := m.readFloat32(targetBase + playerTargetPosX)
 	y := m.readFloat32(targetBase + playerTargetPosY)
 	z := m.readFloat32(targetBase + playerTargetPosZ)
@@ -469,7 +539,7 @@ func (m *Manager) GetTarget() (float32, float32, float32, bool) {
 	return x, y, z, true
 }
 
-// DebugTargetInfo printa informacoes de debug sobre o target atual
+// DebugTargetInfo prints debug info about current target
 func (m *Manager) DebugTargetInfo() {
 	targetID := m.readU32(targetBase + targetIDOffset)
 	flag := m.readU32(targetBase + targetTypeFlag)
@@ -492,13 +562,13 @@ func (m *Manager) DebugTargetInfo() {
 	fmt.Printf("[DEBUG] Player coords: (%.1f, %.1f, %.1f)\n", playerX, playerY, playerZ)
 }
 
-// HasTargetByID verifica se tem target usando o ID
+// HasTargetByID checks if has target using ID
 func (m *Manager) HasTargetByID() bool {
 	targetID := m.readU32(targetBase + targetIDOffset)
 	return targetID != 0
 }
 
-// HasPlayerTarget verifica se tem um player como target
+// HasPlayerTarget checks if target is a player
 func (m *Manager) HasPlayerTarget() bool {
 	if !m.HasTargetByID() {
 		return false
@@ -507,7 +577,7 @@ func (m *Manager) HasPlayerTarget() bool {
 	return flag == 0
 }
 
-// CalculateDistance calcula a distancia 3D entre dois pontos
+// CalculateDistance calculates 3D distance between two points
 func CalculateDistance(x1, y1, z1, x2, y2, z2 float32) float32 {
 	dx := x2 - x1
 	dy := y2 - y1
@@ -515,7 +585,7 @@ func CalculateDistance(x1, y1, z1, x2, y2, z2 float32) float32 {
 	return float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
 }
 
-// GetColorByDistance retorna a cor baseada na distancia
+// GetColorByDistance returns color based on distance
 func GetColorByDistance(distance float32) uintptr {
 	if distance <= 25 {
 		return COLOR_GREEN
@@ -539,7 +609,7 @@ func (m *Manager) Enable() {
 	if !m.running {
 		m.running = true
 		go m.renderLoop()
-		go m.aimbotLoop() // Aimbot em goroutine separada
+		go m.aimbotLoop() // Aimbot in separate goroutine
 	}
 }
 
@@ -553,7 +623,7 @@ func (m *Manager) Disable() {
 	procShowWindow.Call(m.overlayHwnd, SW_HIDE)
 }
 
-// Toggle alterna o estado do ESP
+// Toggle toggles ESP state
 func (m *Manager) Toggle() bool {
 	if m.enabled {
 		m.Disable()
@@ -563,12 +633,12 @@ func (m *Manager) Toggle() bool {
 	return m.enabled
 }
 
-// IsEnabled retorna se o ESP esta ativo
+// IsEnabled returns if ESP is enabled
 func (m *Manager) IsEnabled() bool {
 	return m.enabled
 }
 
-// Stop para o loop de renderizacao
+// Stop stops the render loop
 func (m *Manager) Stop() {
 	if m.running {
 		m.running = false
@@ -594,7 +664,7 @@ func (m *Manager) clearBackBuffer() {
 }
 
 func (m *Manager) present() {
-	// Copia o back buffer para a tela de uma vez (elimina flickering)
+	// Copy back buffer to screen at once (eliminates flickering)
 	procBitBlt.Call(m.hdc, 0, 0, uintptr(m.screenW), uintptr(m.screenH),
 		m.backDC, 0, 0, SRCCOPY)
 }
@@ -699,13 +769,10 @@ func (m *Manager) drawText(x, y int32, text string, color uintptr) {
 		procSelectObject.Call(m.backDC, m.font)
 	}
 
-	// Shadow
-	procSetBkMode.Call(m.backDC, TRANSPARENT)
-	procSetTextColor.Call(m.backDC, COLOR_BLACK)
 	textPtr := syscall.StringToUTF16Ptr(text)
-	procTextOutW.Call(m.backDC, uintptr(x+1), uintptr(y+1), uintptr(unsafe.Pointer(textPtr)), uintptr(len(text)))
 
-	// Main text
+	// Draw text without shadow
+	procSetBkMode.Call(m.backDC, TRANSPARENT)
 	procSetTextColor.Call(m.backDC, color)
 	procTextOutW.Call(m.backDC, uintptr(x), uintptr(y), uintptr(unsafe.Pointer(textPtr)), uintptr(len(text)))
 }
@@ -718,7 +785,7 @@ func (m *Manager) renderLoop() {
 		default:
 		}
 
-		time.Sleep(8 * time.Millisecond) // ~120 FPS para aimbot mais responsivo
+		time.Sleep(8 * time.Millisecond) // ~120 FPS for more responsive aimbot
 
 		// Process messages
 		var msg MSG
@@ -731,10 +798,10 @@ func (m *Manager) renderLoop() {
 			procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
 		}
 
-		// Aimbot agora roda em goroutine separada (aimbotLoop)
+		// Aimbot now runs in separate goroutine (aimbotLoop)
 
 		if !m.enabled {
-			m.clearOverlay() // Limpa quando desabilitado
+			m.clearOverlay() // Clear when disabled
 			continue
 		}
 
@@ -745,69 +812,386 @@ func (m *Manager) renderLoop() {
 			continue
 		}
 
-		// Get player target (ignora mobs)
-		targetX, targetY, targetZ, hasTarget := m.GetTarget()
-		if !hasTarget {
-			m.lastTargetX = 0
-			m.lastTargetY = 0
-			m.clearOverlay()
-			continue
-		}
+		// CRITICAL: Force window to be transparent by default
+		// Only make it clickable if mouse is over UI
+		m.setWindowClickable(false)
 
-		// Calculate distance
-		distance := CalculateDistance(playerX, playerY, playerZ, targetX, targetY, targetZ)
-
-		// Cor baseada na distancia
-		color := GetColorByDistance(distance)
-
-		// WorldToScreen (ordem: X, Z, Y)
-		screenX, screenY := m.WorldToScreen(targetX, targetZ, targetY)
-
-		// Convert to pixels
-		pixelX := int32(screenX * float32(m.screenW) / 100.0)
-		pixelY := int32(screenY * float32(m.screenH) / 100.0)
-
-		if pixelX <= 0 || pixelX >= m.screenW || pixelY <= 0 || pixelY >= m.screenH {
-			m.clearOverlay()
-			continue
-		}
-
-		// Store target position for aimbot
-		m.lastTargetX = pixelX
-		m.lastTargetY = pixelY
+		// Process mouse clicks for checkboxes
+		m.processMouseInput()
 
 		// === DOUBLE BUFFERING ===
 		// 1. Limpa o back buffer
 		m.clearBackBuffer()
 
-		// Box dimensions (menor)
-		boxW := int32(30)
-		boxH := int32(50)
-		boxX := pixelX - boxW/2
-		boxY := pixelY - boxH/2
+		// Target ESP (always active when has target)
+		targetX, targetY, targetZ, hasTarget := m.GetTarget()
+		if hasTarget {
+			// Calculate distance
+			distance := CalculateDistance(playerX, playerY, playerZ, targetX, targetY, targetZ)
 
-		// 2. Desenha tudo no back buffer
-		switch m.Style {
-		case StyleCorners:
-			m.drawCorners(boxX, boxY, boxW, boxH, color)
-		case StyleFullBox:
-			m.drawFullBox(boxX, boxY, boxW, boxH, color)
-		case StyleCircle:
-			m.drawCircle(pixelX, pixelY, 25, color)
-		case StyleBrackets:
-			m.drawBrackets(boxX, boxY, boxW, boxH, color)
+			// Color based on distance
+			color := GetColorByDistance(distance)
+
+			// WorldToScreen (order: X, Z, Y)
+			screenX, screenY, screenZ := m.WorldToScreen(targetX, targetZ, targetY)
+
+			// Filter target behind camera (screenZ >= 1.0 = behind)
+			isInvalidZ := math.IsNaN(float64(screenZ)) || math.IsInf(float64(screenZ), 0)
+			if !isInvalidZ && screenZ < 1.0 &&
+				screenX >= 0 && screenX <= 100 && screenY >= 0 && screenY <= 100 {
+				// Convert to pixels
+				pixelX := int32(screenX * float32(m.screenW) / 100.0)
+				pixelY := int32(screenY * float32(m.screenH) / 100.0)
+
+					if pixelX > 0 && pixelX < m.screenW && pixelY > 0 && pixelY < m.screenH {
+					// Store target position for aimbot
+					m.lastTargetX = pixelX
+					m.lastTargetY = pixelY
+
+					// Box dimensions (small)
+					boxW := int32(30)
+					boxH := int32(50)
+					boxX := pixelX - boxW/2
+					boxY := pixelY - boxH/2
+
+					// Draw target ESP
+					switch m.Style {
+					case StyleCorners:
+						m.drawCorners(boxX, boxY, boxW, boxH, color)
+					case StyleFullBox:
+						m.drawFullBox(boxX, boxY, boxW, boxH, color)
+					case StyleCircle:
+						m.drawCircle(pixelX, pixelY, 25, color)
+					case StyleBrackets:
+						m.drawBrackets(boxX, boxY, boxW, boxH, color)
+					}
+
+					// Draw label with distance
+					labelText := fmt.Sprintf("TARGET %.0fm", distance)
+					m.drawText(pixelX-30, boxY-18, labelText, COLOR_RED)
+				}
+			}
+		} else {
+			m.lastTargetX = 0
+			m.lastTargetY = 0
 		}
 
-		// Draw label com distancia
-		labelText := fmt.Sprintf("PLAYER %.0fm", distance)
-		m.drawText(pixelX-25, boxY-18, labelText, color)
+		// All Entities ESP (additional, when enabled)
+		// Don't render All Entities if overlay is hidden
+		// to avoid race condition in WorldToScreen
+		isVisible, _, _ := procIsWindowVisible.Call(m.overlayHwnd)
+		if m.allEntitiesManager.IsEnabled() && isVisible != 0 {
+			// Cache is updated in background goroutine (separate module)
+			entities := m.allEntitiesManager.GetCachedEntities()
 
-		// 3. Copia o back buffer para a tela de uma vez (sem flicker)
+			// Render all entities
+			renderedCount := 0
+			skippedOffscreen := 0
+			skippedFiltered := 0
+			for _, entity := range entities {
+				// Filter by type
+				if entity.IsPlayer && !m.allEntitiesManager.GetShowPlayers() {
+					skippedFiltered++
+					continue
+				}
+				if entity.IsNPC && !m.allEntitiesManager.GetShowNPCs() {
+					skippedFiltered++
+					continue
+				}
+				if entity.IsMate && !m.allEntitiesManager.GetShowMates() {
+					skippedFiltered++
+					continue
+				}
+
+				// WorldToScreen (order: X, Z, Y)
+				screenX, screenY, screenZ := m.WorldToScreen(entity.PosX, entity.PosZ, entity.PosY)
+
+				// Filter entities behind camera (screenZ >= 1.0 = behind)
+				isInvalidZ := math.IsNaN(float64(screenZ)) || math.IsInf(float64(screenZ), 0)
+				if isInvalidZ || screenZ >= 1.0 {
+					skippedOffscreen++
+					continue
+				}
+
+				// Filter entities off screen
+				if screenX < 0 || screenX > 100 || screenY < 0 || screenY > 100 {
+					skippedOffscreen++
+					continue
+				}
+
+				pixelX := int32(screenX * float32(m.screenW) / 100.0)
+				pixelY := int32(screenY * float32(m.screenH) / 100.0)
+
+				if pixelX <= 0 || pixelX >= m.screenW || pixelY <= 0 || pixelY >= m.screenH {
+					skippedOffscreen++
+					continue
+				}
+
+				renderedCount++
+				color := GetColorByDistance(entity.Distance)
+
+				// All Entities ESP: desenho minimalista (bolinha pequena)
+				m.drawCircle(pixelX, pixelY, 4, color)
+
+				// Small label with type and distance below the dot
+				entityType := "NPC"
+				if entity.IsPlayer {
+					entityType = "P"
+				} else if entity.IsMate {
+					entityType = "M"
+				} else {
+					entityType = "N"
+				}
+				labelText := fmt.Sprintf("%s %.0fm", entityType, entity.Distance)
+				m.drawText(pixelX-15, pixelY+8, labelText, color)
+
+				// Nome apenas se for player ou mate
+				if (entity.IsPlayer || entity.IsMate) && entity.Name != "" && len(entity.Name) < 20 {
+					m.drawText(pixelX-25, pixelY-10, entity.Name, COLOR_WHITE)
+				}
+			}
+
+			// Debug output (unused)
+			_ = skippedFiltered
+			_ = renderedCount
+			_ = skippedOffscreen
+		}
+
+		// Draw filter checkboxes UI
+		if m.uiVisible && m.allEntitiesManager.IsEnabled() {
+			m.drawFilterUI()
+		}
+
+		// 3. Copy back buffer to screen at once (no flicker)
 		m.present()
 	}
 }
 
-// SetStyle muda o estilo do ESP
+// processMouseInput detecta cliques nos checkboxes
+func (m *Manager) processMouseInput() {
+	// Get cursor position
+	var pt POINT
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	procScreenToClient.Call(m.overlayHwnd, uintptr(unsafe.Pointer(&pt)))
+
+	// Check if mouse is over UI area - only make window clickable if it is
+	if m.isMouseOverUI(pt.X, pt.Y) {
+		m.setWindowClickable(true)
+	} else {
+		m.setWindowClickable(false)
+	}
+
+	// Check if left mouse button is pressed
+	ret, _, _ := procGetAsyncKeyState.Call(0x01) // VK_LBUTTON
+	isPressed := (ret & 0x8000) != 0
+
+	// Detect click (press and release)
+	if isPressed && !m.lastMouseState {
+
+		// Check if click is on Players checkbox
+		if m.isPointInCheckbox(pt.X, pt.Y, m.checkboxPlayerX, m.checkboxPlayerY) {
+			showPlayers := m.allEntitiesManager.ToggleShowPlayers()
+			fmt.Printf("[UI] Show Players: %v\n", showPlayers)
+		}
+
+		// Check if click is on NPCs checkbox
+		if m.isPointInCheckbox(pt.X, pt.Y, m.checkboxNPCX, m.checkboxNPCY) {
+			showNPCs := m.allEntitiesManager.ToggleShowNPCs()
+			fmt.Printf("[UI] Show NPCs: %v\n", showNPCs)
+		}
+
+		// Check if click is on Mates checkbox
+		if m.isPointInCheckbox(pt.X, pt.Y, m.checkboxMateX, m.checkboxMateY) {
+			showMates := m.allEntitiesManager.ToggleShowMates()
+			fmt.Printf("[UI] Show Mates: %v\n", showMates)
+		}
+
+		// Check if click is on Range Decrease button
+		if m.isPointInButton(pt.X, pt.Y, m.rangeDecBtnX, m.rangeDecBtnY, m.rangeBtnSize) {
+			maxRange := m.allEntitiesManager.GetMaxRange()
+			if maxRange > 50.0 {
+				m.allEntitiesManager.SetMaxRange(maxRange - 25.0)
+				fmt.Printf("[UI] Max Range: %.0fm\n", maxRange-25.0)
+			}
+		}
+
+		// Check if click is on Range Increase button
+		if m.isPointInButton(pt.X, pt.Y, m.rangeIncBtnX, m.rangeIncBtnY, m.rangeBtnSize) {
+			maxRange := m.allEntitiesManager.GetMaxRange()
+			if maxRange < 500.0 {
+				m.allEntitiesManager.SetMaxRange(maxRange + 25.0)
+				fmt.Printf("[UI] Max Range: %.0fm\n", maxRange+25.0)
+			}
+		}
+	}
+
+	m.lastMouseState = isPressed
+}
+
+// isPointInCheckbox checks if a point is inside a checkbox
+func (m *Manager) isPointInCheckbox(px, py, cx, cy int32) bool {
+	// Expand clickable area a bit for easier clicking (checkbox + label)
+	expandedW := m.checkboxSize + 80
+	expandedH := m.checkboxSize + 4
+	return px >= cx && px <= cx+expandedW && py >= cy && py <= cy+expandedH
+}
+
+// isPointInButton checks if a point is inside a square button
+func (m *Manager) isPointInButton(px, py, bx, by, size int32) bool {
+	return px >= bx && px <= bx+size && py >= by && py <= by+size
+}
+
+// isMouseOverUI checks if mouse is over UI area (filter panel)
+func (m *Manager) isMouseOverUI(px, py int32) bool {
+	if !m.uiVisible || !m.allEntitiesManager.IsEnabled() {
+		return false
+	}
+
+	// UI panel area (top-right corner)
+	startX := m.screenW - 150
+	startY := int32(10)
+	panelX := startX - 5
+	panelY := startY - 5
+	panelW := int32(140)
+	panelH := int32(110)
+
+	return px >= panelX && px <= panelX+panelW && py >= panelY && py <= panelY+panelH
+}
+
+// drawFilterUI draws filter checkboxes
+func (m *Manager) drawFilterUI() {
+	// Position checkboxes in top-right corner
+	startX := m.screenW - 150
+	startY := int32(10)
+
+	// Update checkbox positions
+	m.checkboxPlayerX = startX
+	m.checkboxPlayerY = startY
+	m.checkboxNPCX = startX
+	m.checkboxNPCY = startY + 25
+	m.checkboxMateX = startX
+	m.checkboxMateY = startY + 50
+
+	// Range controls position
+	rangeY := startY + 75
+	m.rangeDecBtnX = startX
+	m.rangeDecBtnY = rangeY
+	m.rangeIncBtnX = startX + 100
+	m.rangeIncBtnY = rangeY
+
+	// Draw semi-transparent background panel (increased height for range controls)
+	panelX := startX - 5
+	panelY := startY - 5
+	panelW := int32(140)
+	panelH := int32(110) // Increased for Mates checkbox
+	m.drawFilledRect(panelX, panelY, panelW, panelH, 0x00000000, 180)
+
+	// Draw Players checkbox and label
+	m.drawCheckbox(m.checkboxPlayerX, m.checkboxPlayerY, m.allEntitiesManager.GetShowPlayers())
+	m.drawText(m.checkboxPlayerX+m.checkboxSize+5, m.checkboxPlayerY, "Players", COLOR_WHITE)
+
+	// Draw NPCs checkbox and label
+	m.drawCheckbox(m.checkboxNPCX, m.checkboxNPCY, m.allEntitiesManager.GetShowNPCs())
+	m.drawText(m.checkboxNPCX+m.checkboxSize+5, m.checkboxNPCY, "NPCs", COLOR_WHITE)
+
+	// Draw Mates checkbox and label
+	m.drawCheckbox(m.checkboxMateX, m.checkboxMateY, m.allEntitiesManager.GetShowMates())
+	m.drawText(m.checkboxMateX+m.checkboxSize+5, m.checkboxMateY, "Mates", COLOR_WHITE)
+
+	// Draw Range label and value
+	rangeText := fmt.Sprintf("Range: %.0fm", m.allEntitiesManager.GetMaxRange())
+	m.drawText(startX, rangeY-20, rangeText, COLOR_WHITE)
+
+	// Draw Range decrease button (-)
+	m.drawButton(m.rangeDecBtnX, m.rangeDecBtnY, m.rangeBtnSize, "-")
+
+	// Draw Range increase button (+)
+	m.drawButton(m.rangeIncBtnX, m.rangeIncBtnY, m.rangeBtnSize, "+")
+}
+
+// drawCheckbox draws a checkbox
+func (m *Manager) drawCheckbox(x, y int32, checked bool) {
+	// Draw checkbox outline
+	var color uintptr
+	if checked {
+		color = uintptr(COLOR_GREEN)
+	} else {
+		color = uintptr(COLOR_WHITE)
+	}
+
+	// Outer box
+	m.drawLine(x, y, x+m.checkboxSize, y, color, 2)
+	m.drawLine(x+m.checkboxSize, y, x+m.checkboxSize, y+m.checkboxSize, color, 2)
+	m.drawLine(x+m.checkboxSize, y+m.checkboxSize, x, y+m.checkboxSize, color, 2)
+	m.drawLine(x, y+m.checkboxSize, x, y, color, 2)
+
+	// Draw checkmark if checked
+	if checked {
+		// Inner filled box
+		colorU32 := uint32(COLOR_GREEN)
+		m.drawFilledRect(x+2, y+2, m.checkboxSize-4, m.checkboxSize-4, colorU32, 255)
+	}
+}
+
+// drawButton draws a button with text
+func (m *Manager) drawButton(x, y, size int32, text string) {
+	color := uintptr(COLOR_WHITE)
+
+	// Draw button outline
+	m.drawLine(x, y, x+size, y, color, 2)
+	m.drawLine(x+size, y, x+size, y+size, color, 2)
+	m.drawLine(x+size, y+size, x, y+size, color, 2)
+	m.drawLine(x, y+size, x, y, color, 2)
+
+	// Draw button text centered
+	textOffset := int32(6)
+	if text == "+" {
+		textOffset = 5
+	}
+	m.drawText(x+textOffset, y+2, text, COLOR_WHITE)
+}
+
+// drawFilledRect draws a filled rectangle with transparency
+func (m *Manager) drawFilledRect(x, y, w, h int32, color uint32, alpha byte) {
+	// Create semi-transparent brush
+	r := byte((color >> 16) & 0xFF)
+	g := byte((color >> 8) & 0xFF)
+	b := byte(color & 0xFF)
+
+	// For now, draw a simple filled rectangle (GDI doesn't support alpha blending easily)
+	// We'll use a darker color to simulate transparency
+	darkColor := uint32(r/3)<<16 | uint32(g/3)<<8 | uint32(b/3)
+
+	brush, _, _ := procCreateSolidBrush.Call(uintptr(darkColor))
+	defer procDeleteObject.Call(brush)
+
+	rect := RECT{
+		Left:   x,
+		Top:    y,
+		Right:  x + w,
+		Bottom: y + h,
+	}
+
+	procFillRect.Call(m.backDC, uintptr(unsafe.Pointer(&rect)), brush)
+}
+
+// setWindowClickable toggles window transparency to allow clicks
+func (m *Manager) setWindowClickable(clickable bool) {
+	const gwlExStyle = ^uintptr(0) - 19 // -20 in two's complement
+	exStyle, _, _ := procGetWindowLongW.Call(m.overlayHwnd, gwlExStyle)
+
+	if clickable {
+		// Remove WS_EX_TRANSPARENT to allow clicks
+		exStyle &^= WS_EX_TRANSPARENT
+	} else {
+		// Add WS_EX_TRANSPARENT to make clicks pass through
+		exStyle |= WS_EX_TRANSPARENT
+	}
+
+	procSetWindowLongW.Call(m.overlayHwnd, gwlExStyle, exStyle)
+}
+
+// SetStyle changes ESP style
 func (m *Manager) SetStyle(style ESPStyle) {
 	m.Style = style
 }
@@ -818,7 +1202,7 @@ func (m *Manager) CycleStyle() ESPStyle {
 	return m.Style
 }
 
-// GetStyleName retorna o nome do estilo atual
+// GetStyleName returns current style name
 func (m *Manager) GetStyleName() string {
 	switch m.Style {
 	case StyleCorners:
@@ -834,6 +1218,54 @@ func (m *Manager) GetStyleName() string {
 	}
 }
 
+// ToggleAllEntities toggles all entities ESP
+func (m *Manager) ToggleAllEntities() bool {
+	if m.allEntitiesManager.IsEnabled() {
+		m.allEntitiesManager.Stop()
+		// Make sure window is transparent when ESP is disabled
+		m.setWindowClickable(false)
+	} else {
+		m.allEntitiesManager.Start()
+	}
+	return m.allEntitiesManager.IsEnabled()
+}
+
+// IsAllEntitiesEnabled returns if all entities ESP is enabled
+func (m *Manager) IsAllEntitiesEnabled() bool {
+	return m.allEntitiesManager.IsEnabled()
+}
+
+// ToggleShowPlayers toggles players filter
+func (m *Manager) ToggleShowPlayers() bool {
+	return m.allEntitiesManager.ToggleShowPlayers()
+}
+
+// ToggleShowNPCs toggles NPCs filter
+func (m *Manager) ToggleShowNPCs() bool {
+	return m.allEntitiesManager.ToggleShowNPCs()
+}
+
+// GetShowPlayers returns players filter state
+func (m *Manager) GetShowPlayers() bool {
+	return m.allEntitiesManager.GetShowPlayers()
+}
+
+// GetShowNPCs returns NPCs filter state
+func (m *Manager) GetShowNPCs() bool {
+	return m.allEntitiesManager.GetShowNPCs()
+}
+
+// ToggleShowMates toggles mates filter
+func (m *Manager) ToggleShowMates() bool {
+	return m.allEntitiesManager.ToggleShowMates()
+}
+
+// GetShowMates returns mates filter state
+func (m *Manager) GetShowMates() bool {
+	return m.allEntitiesManager.GetShowMates()
+}
+
+// InstallPersistentHook instala o hook permanente
 // ============================================================================
 // Aimbot Functions
 // ============================================================================
@@ -848,50 +1280,50 @@ func (m *Manager) DisableAimbot() {
 	m.aimbotEnabled = false
 }
 
-// ToggleAimbot alterna o estado do aimbot
+// ToggleAimbot toggles aimbot state
 func (m *Manager) ToggleAimbot() bool {
 	m.aimbotEnabled = !m.aimbotEnabled
 	return m.aimbotEnabled
 }
 
-// IsAimbotEnabled retorna se o aimbot esta ativo
+// IsAimbotEnabled returns if aimbot is enabled
 func (m *Manager) IsAimbotEnabled() bool {
 	return m.aimbotEnabled
 }
 
-// SetAimbotKeys configura as teclas que ativam o aimbot quando pressionadas
+// SetAimbotKeys sets keys that activate aimbot when pressed
 func (m *Manager) SetAimbotKeys(keys []int) {
 	m.aimbotKeys = keys
 }
 
-// AddAimbotKey adiciona uma tecla ao aimbot
+// AddAimbotKey adds a key to aimbot
 func (m *Manager) AddAimbotKey(key int) {
 	m.aimbotKeys = append(m.aimbotKeys, key)
 }
 
-// GetAimbotKeys retorna as teclas configuradas
+// GetAimbotKeys returns configured keys
 func (m *Manager) GetAimbotKeys() []int {
 	return m.aimbotKeys
 }
 
-// ClearAimbotKeys limpa todas as teclas do aimbot
+// ClearAimbotKeys clears all aimbot keys
 func (m *Manager) ClearAimbotKeys() {
 	m.aimbotKeys = nil
 }
 
-// AimbotKeyConfig representa uma tecla configurada
+// AimbotKeyConfig represents a configured key
 type AimbotKeyConfig struct {
 	Name string `json:"name"`
 	Code int    `json:"code"`
 }
 
-// AimbotConfig representa a configuracao do aimbot
+// AimbotConfig represents aimbot configuration
 type AimbotConfig struct {
 	Enabled bool              `json:"enabled"`
 	Keys    []AimbotKeyConfig `json:"keys"`
 }
 
-// LoadAimbotConfig carrega a configuracao do aimbot de um arquivo JSON
+// LoadAimbotConfig loads aimbot config from JSON file
 func (m *Manager) LoadAimbotConfig(filename string) error {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -914,7 +1346,7 @@ func (m *Manager) LoadAimbotConfig(filename string) error {
 	return nil
 }
 
-// SaveAimbotConfig salva a configuracao atual do aimbot
+// SaveAimbotConfig saves current aimbot config
 func (m *Manager) SaveAimbotConfig(filename string) error {
 	config := AimbotConfig{
 		Enabled: m.aimbotEnabled,
@@ -936,7 +1368,7 @@ func (m *Manager) SaveAimbotConfig(filename string) error {
 	return os.WriteFile(filename, data, 0644)
 }
 
-// isAimbotKeyPressed verifica se alguma tecla do aimbot esta pressionada
+// isAimbotKeyPressed checks if any aimbot key is pressed
 func (m *Manager) isAimbotKeyPressed() bool {
 	for _, key := range m.aimbotKeys {
 		ret, _, _ := procGetAsyncKeyState.Call(uintptr(key))
@@ -947,7 +1379,7 @@ func (m *Manager) isAimbotKeyPressed() bool {
 	return false
 }
 
-// aimbotLoop roda em goroutine separada com alta taxa de atualizacao
+// aimbotLoop runs in separate goroutine with high update rate
 func (m *Manager) aimbotLoop() {
 	m.aimbotRunning = true
 	defer func() { m.aimbotRunning = false }()
@@ -959,26 +1391,27 @@ func (m *Manager) aimbotLoop() {
 		default:
 		}
 
-		// Taxa alta: ~500 FPS (2ms)
-		time.Sleep(2 * time.Millisecond)
+		// Taxa otimizada: ~240 FPS (4ms)
+		time.Sleep(4 * time.Millisecond)
 
-		// Aimbot ativa apenas quando tecla do config esta pressionada
+		// Aimbot activates only when config key is pressed
+		// Mutex in WorldToScreen protects against race condition with ESP
 		if m.isAimbotKeyPressed() {
 			m.AimAtTarget()
 		}
 	}
 }
 
-// AimAtTarget move o cursor para a posicao do alvo
+// AimAtTarget moves cursor to target position
 func (m *Manager) AimAtTarget() bool {
 	return m.AimAtTargetDebug(false)
 }
 
-// AimAtTargetDebug move o cursor com debug opcional
+// AimAtTargetDebug moves cursor with optional debug
 func (m *Manager) AimAtTargetDebug(debug bool) bool {
 	targetID := m.readU32(targetBase + targetIDOffset)
 
-	// Verifica se tem target selecionado
+	// Check if target is selected
 	if targetID == 0 {
 		if debug {
 			fmt.Println("[AIM] FAIL: No target (ID=0)")
@@ -986,7 +1419,7 @@ func (m *Manager) AimAtTargetDebug(debug bool) bool {
 		return false
 	}
 
-	// Pega coordenadas do player target (ignora flag, usa coords diretamente)
+	// Get player target coordinates
 	targetX := m.readFloat32(targetBase + playerTargetPosX)
 	targetY := m.readFloat32(targetBase + playerTargetPosY)
 	targetZ := m.readFloat32(targetBase + playerTargetPosZ)
@@ -998,15 +1431,32 @@ func (m *Manager) AimAtTargetDebug(debug bool) bool {
 		return false
 	}
 
-	// WorldToScreen (ordem: X, Z, Y)
-	screenX, screenY := m.WorldToScreen(targetX, targetZ, targetY)
+	// WorldToScreen (order: X, Z, Y)
+	screenX, screenY, screenZ := m.WorldToScreen(targetX, targetZ, targetY)
+
+	// Filter target behind camera (screenZ >= 1.0 = behind)
+	isInvalidZ := math.IsNaN(float64(screenZ)) || math.IsInf(float64(screenZ), 0)
+	if isInvalidZ || screenZ >= 1.0 {
+		if debug {
+			fmt.Printf("[AIM] FAIL: Behind camera (screenZ=%.4f, invalid=%v)\n", screenZ, isInvalidZ)
+		}
+		return false
+	}
+
+	// Filter target off screen
+	if screenX < 0 || screenX > 100 || screenY < 0 || screenY > 100 {
+		if debug {
+			fmt.Printf("[AIM] FAIL: Off screen (screen: %.1f,%.1f)\n", screenX, screenY)
+		}
+		return false
+	}
 
 	// Convert to pixels
 	pixelX := int32(screenX * float32(m.screenW) / 100.0)
 	pixelY := int32(screenY * float32(m.screenH) / 100.0)
 
-	// Ajuste para mirar no centro do personagem (em pixels 2D, após projeção)
-	// Subtrai pixels para mirar mais alto (Y cresce para baixo na tela)
+	// Adjust to aim at character center (in 2D pixels, after projection)
+	// Subtract pixels to aim higher (Y grows downward on screen)
 	pixelY -= 15
 
 	if pixelX <= 0 || pixelX >= m.screenW || pixelY <= 0 || pixelY >= m.screenH {
@@ -1021,12 +1471,13 @@ func (m *Manager) AimAtTargetDebug(debug bool) bool {
 			targetID, targetX, targetY, targetZ, pixelX, pixelY)
 	}
 
-	// SetCursorPos usa coordenadas absolutas da tela
+	// SetCursorPos uses absolute screen coordinates
 	ret, _, _ := procSetCursorPos.Call(uintptr(pixelX), uintptr(pixelY))
+
 	return ret != 0
 }
 
-// IsTargetPlayer retorna true se o target atual eh um player
+// IsTargetPlayer returns true if current target is a player
 func (m *Manager) IsTargetPlayer() bool {
 	if !m.HasTarget() {
 		return false
@@ -1035,7 +1486,7 @@ func (m *Manager) IsTargetPlayer() bool {
 	return flag == 0
 }
 
-// GetTargetScreenPos retorna a posicao do alvo na tela
+// GetTargetScreenPos returns target position on screen
 func (m *Manager) GetTargetScreenPos() (int32, int32, bool) {
 	if m.lastTargetX <= 0 || m.lastTargetY <= 0 {
 		return 0, 0, false
@@ -1047,7 +1498,7 @@ func (m *Manager) GetTargetScreenPos() (int32, int32, bool) {
 // Target Memory Scanner/Debug
 // ============================================================================
 
-// TargetScanner monitora mudanças na região de memória do target
+// TargetScanner monitors changes in target memory region
 type TargetScanner struct {
 	handle        uintptr
 	baseAddr      uintptr
@@ -1058,17 +1509,17 @@ type TargetScanner struct {
 	scanning      bool
 }
 
-// NewTargetScanner cria um novo scanner de target
+// NewTargetScanner creates a new target scanner
 func (m *Manager) NewTargetScanner() *TargetScanner {
 	return &TargetScanner{
 		handle:   m.processHandle,
 		baseAddr: targetBase,
-		scanSize: 0x800, // Scan 2KB ao redor do targetBase
+		scanSize: 0x800, // Scan 2KB around targetBase
 		scanning: false,
 	}
 }
 
-// StartScanning inicia o scan e cria arquivo de debug
+// StartScanning starts scanning and creates debug file
 func (ts *TargetScanner) StartScanning() error {
 	filename := fmt.Sprintf("target_scan_%s.txt", time.Now().Format("2006-01-02_15-04-05"))
 	file, err := os.Create(filename)
@@ -1079,7 +1530,7 @@ func (ts *TargetScanner) StartScanning() error {
 	ts.scanning = true
 	ts.scanCount = 0
 
-	// Header do arquivo
+	// File header
 	ts.debugFile.WriteString("========================================\n")
 	ts.debugFile.WriteString("  TARGET MEMORY SCANNER DEBUG LOG\n")
 	ts.debugFile.WriteString(fmt.Sprintf("  Base: 0x%08X  Size: 0x%X\n", ts.baseAddr, ts.scanSize))
@@ -1094,7 +1545,7 @@ func (ts *TargetScanner) StartScanning() error {
 	return nil
 }
 
-// StopScanning para o scan e fecha o arquivo
+// StopScanning stops scanning and closes the file
 func (ts *TargetScanner) StopScanning() {
 	if ts.debugFile != nil {
 		ts.debugFile.WriteString("\n========================================\n")
@@ -1108,12 +1559,12 @@ func (ts *TargetScanner) StopScanning() {
 	fmt.Println("[SCANNER] Parado!")
 }
 
-// IsScanning retorna se está escaneando
+// IsScanning returns if scanning is active
 func (ts *TargetScanner) IsScanning() bool {
 	return ts.scanning
 }
 
-// readMemoryRegion lê a região de memória
+// readMemoryRegion reads the memory region
 func (ts *TargetScanner) readMemoryRegion() []byte {
 	data := make([]byte, ts.scanSize)
 	var bytesRead uintptr
@@ -1129,7 +1580,7 @@ func (ts *TargetScanner) readMemoryRegion() []byte {
 	return data
 }
 
-// ScanForChanges detecta e loga mudanças
+// ScanForChanges detects and logs changes
 func (ts *TargetScanner) ScanForChanges(label string) {
 	if !ts.scanning || ts.debugFile == nil {
 		return
@@ -1138,7 +1589,7 @@ func (ts *TargetScanner) ScanForChanges(label string) {
 	ts.scanCount++
 	currentSnapshot := ts.readMemoryRegion()
 
-	// Detectar mudanças
+	// Detect changes
 	changes := ts.compareSnapshots(ts.prevSnapshot, currentSnapshot)
 
 	if len(changes) > 0 {
@@ -1150,7 +1601,7 @@ func (ts *TargetScanner) ScanForChanges(label string) {
 			ts.debugFile.WriteString(change)
 		}
 
-		// Log floats interessantes na região de coordenadas
+		// Log interesting floats in coordinates region
 		ts.logInterestingFloats(currentSnapshot)
 
 		fmt.Printf("[SCANNER] Scan #%d: %d mudanças detectadas\n", ts.scanCount, len(changes))
@@ -1159,11 +1610,11 @@ func (ts *TargetScanner) ScanForChanges(label string) {
 	ts.prevSnapshot = currentSnapshot
 }
 
-// compareSnapshots compara dois snapshots e retorna as diferenças
+// compareSnapshots compares two snapshots and returns differences
 func (ts *TargetScanner) compareSnapshots(prev, curr []byte) []string {
 	var changes []string
 
-	// Comparar em blocos de 4 bytes (DWORD)
+	// Compare in 4-byte blocks (DWORD)
 	for i := 0; i+4 <= len(prev) && i+4 <= len(curr); i += 4 {
 		prevVal := binary.LittleEndian.Uint32(prev[i : i+4])
 		currVal := binary.LittleEndian.Uint32(curr[i : i+4])
@@ -1173,7 +1624,7 @@ func (ts *TargetScanner) compareSnapshots(prev, curr []byte) []string {
 			prevFloat := math.Float32frombits(prevVal)
 			currFloat := math.Float32frombits(currVal)
 
-			// Verificar se parece ser float válido (coordenadas geralmente entre -100000 e 100000)
+			// Check if looks like valid float (coordinates usually between -100000 and 100000)
 			isValidFloat := (currFloat > -100000 && currFloat < 100000) &&
 				(currFloat != 0) && !math.IsNaN(float64(currFloat)) && !math.IsInf(float64(currFloat), 0)
 
@@ -1192,13 +1643,13 @@ func (ts *TargetScanner) compareSnapshots(prev, curr []byte) []string {
 	return changes
 }
 
-// logSnapshot loga um snapshot completo
+// logSnapshot logs a complete snapshot
 func (ts *TargetScanner) logSnapshot(label string) {
 	ts.debugFile.WriteString(fmt.Sprintf("\n=== %s ===\n", label))
 	ts.logInterestingFloats(ts.prevSnapshot)
 }
 
-// logInterestingFloats loga floats que parecem ser coordenadas
+// logInterestingFloats logs floats that appear to be coordinates
 func (ts *TargetScanner) logInterestingFloats(data []byte) {
 	ts.debugFile.WriteString("\nOffsets com floats interessantes (possiveis coordenadas):\n")
 
@@ -1223,17 +1674,17 @@ func (ts *TargetScanner) logInterestingFloats(data []byte) {
 		}
 	}
 
-	// Procurar outros floats que parecem coordenadas
+	// Search for other floats that look like coordinates
 	ts.debugFile.WriteString("\n  -- Outros Floats (range 100-50000) --\n")
 	count := 0
 	for i := 0; i+4 <= len(data) && count < 50; i += 4 {
 		val := binary.LittleEndian.Uint32(data[i : i+4])
 		floatVal := math.Float32frombits(val)
 
-		// Filtrar floats que parecem coordenadas (valores típicos de posição no jogo)
+		// Filter floats that look like coordinates (typical position values in game)
 		absVal := float32(math.Abs(float64(floatVal)))
 		if absVal > 100 && absVal < 50000 && !math.IsNaN(float64(floatVal)) {
-			// Pular offsets já conhecidos
+			// Skip known offsets
 			_, known := knownOffsets[i]
 			if !known {
 				ts.debugFile.WriteString(fmt.Sprintf("  +0x%03X: 0x%08X (%.2f)\n",
@@ -1243,7 +1694,7 @@ func (ts *TargetScanner) logInterestingFloats(data []byte) {
 		}
 	}
 
-	// Procurar possíveis flags/enums (valores pequenos 0-10)
+	// Search for possible flags/enums (small values 0-10)
 	ts.debugFile.WriteString("\n  -- Possiveis Flags (0-10) --\n")
 	count = 0
 	for i := 0; i+4 <= len(data) && count < 30; i += 4 {
@@ -1255,7 +1706,7 @@ func (ts *TargetScanner) logInterestingFloats(data []byte) {
 	}
 }
 
-// DumpRegion faz um dump completo da região
+// DumpRegion does a full dump of the region
 func (ts *TargetScanner) DumpRegion() {
 	if ts.debugFile == nil {
 		return
@@ -1266,7 +1717,7 @@ func (ts *TargetScanner) DumpRegion() {
 	ts.debugFile.WriteString(fmt.Sprintf("Base: 0x%08X\n\n", ts.baseAddr))
 
 	for i := 0; i < len(data); i += 16 {
-		// Endereço
+		// Address
 		ts.debugFile.WriteString(fmt.Sprintf("%08X: ", uint32(ts.baseAddr)+uint32(i)))
 
 		// Hex bytes
@@ -1286,4 +1737,152 @@ func (ts *TargetScanner) DumpRegion() {
 		}
 		ts.debugFile.WriteString("|\n")
 	}
+}
+
+// ============================================================================
+// Helper functions for entity collection
+// ============================================================================
+
+func isValidPtr(ptr uint32) bool {
+	return ptr >= 0x10000000 && ptr < 0xF0000000
+}
+
+func isValidCoord(coord float32) bool {
+	return coord > -100000 && coord < 100000 && !math.IsNaN(float64(coord)) && !math.IsInf(float64(coord), 0)
+}
+
+func isValidEntityName(name string) bool {
+	if len(name) < 2 || len(name) > 32 {
+		return false
+	}
+
+	alphaCount := 0
+	for _, c := range name {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			alphaCount++
+		} else if c < 32 && c != 0 {
+			return false
+		}
+	}
+	return alphaCount >= 2
+}
+
+func (m *Manager) readU8(addr uintptr) byte {
+	var buf [1]byte
+	var read uintptr
+	procReadProcessMemory.Call(m.processHandle, addr, uintptr(unsafe.Pointer(&buf[0])), 1, uintptr(unsafe.Pointer(&read)))
+	return buf[0]
+}
+
+func (m *Manager) readString(addr uintptr, maxLen int) string {
+	buf := make([]byte, maxLen)
+	var read uintptr
+	ret, _, _ := procReadProcessMemory.Call(m.processHandle, addr, uintptr(unsafe.Pointer(&buf[0])), uintptr(maxLen), uintptr(unsafe.Pointer(&read)))
+	if ret == 0 {
+		return ""
+	}
+	for i, b := range buf {
+		if b == 0 {
+			return string(buf[:i])
+		}
+	}
+	return string(buf)
+}
+
+func (m *Manager) getMaxHP(entityAddr uint32) uint32 {
+	base := m.readU32(uintptr(entityAddr + 0x38))
+	if !isValidPtr(base) {
+		return 0
+	}
+
+	esi := m.readU32(uintptr(base + 0x4698))
+	if !isValidPtr(esi) {
+		return 0
+	}
+
+	stats := m.readU32(uintptr(esi + 0x10))
+	if !isValidPtr(stats) {
+		return 0
+	}
+
+	return m.readU32(uintptr(stats + 0x420))
+}
+
+func (m *Manager) getEntityName(entityAddr uint32) string {
+	namePtr1 := m.readU32(uintptr(entityAddr + 0x0C))
+	if !isValidPtr(namePtr1) {
+		return ""
+	}
+
+	namePtr2 := m.readU32(uintptr(namePtr1 + 0x1C))
+	if !isValidPtr(namePtr2) {
+		return ""
+	}
+
+	return m.readString(uintptr(namePtr2), 32)
+}
+
+// debugEntityFlags compares LocalPlayer with other entities to find flags
+func (m *Manager) debugEntityFlags() {
+	// Get local player entity
+	lpPtr1 := m.readU32(m.x2game + 0xE9DC54)
+	if !isValidPtr(lpPtr1) {
+		return
+	}
+	lpEntity := m.readU32(uintptr(lpPtr1 + 0x10))
+	if !isValidPtr(lpEntity) {
+		return
+	}
+
+	// Common flag offsets to check
+	flagOffsets := []uint32{
+		0x04, 0x08, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C,
+		0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x50, 0x58, 0x60,
+		0x80, 0x84, 0x88, 0x8C, 0x90, 0x94, 0x98,
+	}
+
+	fmt.Println("\n=== ENTITY FLAGS DEBUG ===")
+	fmt.Printf("LocalPlayer Entity: 0x%X\n", lpEntity)
+
+	// Print local player flags
+	fmt.Print("LocalPlayer: ")
+	for _, off := range flagOffsets {
+		val := m.readU32(uintptr(lpEntity + off))
+		fmt.Printf("+%03X=%08X ", off, val)
+	}
+	fmt.Println()
+
+	// Compare with first 3 other entities
+	cachedEntities := m.allEntitiesManager.GetCachedEntities()
+	count := 0
+	for i, entity := range cachedEntities {
+		if count >= 3 {
+			break
+		}
+
+		entityType := "NPC"
+		if entity.IsPlayer {
+			entityType = "PLAYER"
+		} else if entity.IsMate {
+			entityType = "MATE"
+		}
+
+		fmt.Printf("\n%s %-15s (%.0fm): ", entityType, entity.Name, entity.Distance)
+		for _, off := range flagOffsets {
+			val := m.readU32(uintptr(entity.Address + off))
+			lpVal := m.readU32(uintptr(lpEntity + off))
+
+			// Highlight differences with *
+			if val != lpVal {
+				fmt.Printf("+%03X=%08X* ", off, val)
+			} else {
+				fmt.Printf("+%03X=%08X ", off, val)
+			}
+		}
+		fmt.Println()
+
+		count++
+		i = i // suppress unused
+	}
+	fmt.Println("=========================\n")
 }

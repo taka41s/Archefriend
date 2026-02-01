@@ -149,6 +149,11 @@ func NewApp() (*App, error) {
 			fmt.Printf("[AIMBOT] Config não encontrada, usando padrão (Mouse4, Mouse5)\n")
 			espMgr.SetAimbotKeys([]int{0x05, 0x06})
 		}
+
+		// Iniciar ambos ESPs por padrão
+		espMgr.Enable()
+		espMgr.ToggleAllEntities()
+		fmt.Println("[ESP] Target ESP e All Entities ESP iniciados automaticamente")
 	}
 
 	// Create Skill monitor (offset 0x569E1A para hook de skill success)
@@ -196,11 +201,11 @@ func NewApp() (*App, error) {
 	}
 
 	// Ativar hook automaticamente
-	if err := app.skillMonitor.InstallHook(); err != nil {
-		fmt.Printf("[SKILL] Falha ao instalar hook: %v\n", err)
-	} else {
-		fmt.Println("[SKILL] Monitor de skills ATIVADO")
-	}
+	// if err := app.skillMonitor.InstallHook(); err != nil {
+	// 	fmt.Printf("[SKILL] Falha ao instalar hook: %v\n", err)
+	// } else {
+	// 	fmt.Println("[SKILL] Monitor de skills ATIVADO")
+	// }
 
 	if err := app.presetManager.LoadFromJSON("buff_presets.json"); err != nil {
 		app.presetManager.CreateDefaultPresets()
@@ -449,6 +454,36 @@ func (app *App) pollHotkeys() {
 				fmt.Printf("[ESP] Target ESP: %s\n", status)
 			}
 		},
+		0xBD: func() { // MINUS - Toggle All Entities ESP
+			if app.espManager != nil {
+				enabled := app.espManager.ToggleAllEntities()
+				status := "OFF"
+				if enabled {
+					status = "ON"
+				}
+				fmt.Printf("[ESP] All Entities: %s\n", status)
+			}
+		},
+		0xBB: func() { // EQUALS/PLUS - Toggle Show Players
+			if app.espManager != nil {
+				enabled := app.espManager.ToggleShowPlayers()
+				status := "OFF"
+				if enabled {
+					status = "ON"
+				}
+				fmt.Printf("[ESP] Show Players: %s\n", status)
+			}
+		},
+		0xDB: func() { // OPEN BRACKET [ - Toggle Show NPCs
+			if app.espManager != nil {
+				enabled := app.espManager.ToggleShowNPCs()
+				status := "OFF"
+				if enabled {
+					status = "ON"
+				}
+				fmt.Printf("[ESP] Show NPCs: %s\n", status)
+			}
+		},
 		0x24: func() { // HOME - Cycle ESP style
 			if app.espManager != nil && app.espManager.IsEnabled() {
 				style := app.espManager.CycleStyle()
@@ -583,9 +618,14 @@ func (app *App) getDisplayLines() []string {
 		espStyle = app.espManager.GetStyleName()
 	}
 
+	allESPStatus := "OFF"
+	if app.espManager != nil && app.espManager.IsAllEntitiesEnabled() {
+		allESPStatus = "ON"
+	}
+
 	lines = append(lines, fmt.Sprintf("[F1] Loot:%s  [F2] Doodad:%s  [F3] Spam  [F4] AutoSpam:%s", lootStatus, doodadStatus, spamStatus))
 	lines = append(lines, fmt.Sprintf("[F5] Reload  [F6] Reactions:%s  [F10] AFK:%s", reactionStatus, afkStatus))
-	lines = append(lines, fmt.Sprintf("[F12] ESP:%s %s  [PGDN] Aim", espStatus, espStyle))
+	lines = append(lines, fmt.Sprintf("[F12] ESP:%s %s  [PGDN] Aim  [-] AllESP:%s", espStatus, espStyle, allESPStatus))
 	lines = append(lines, "[F7] Config  [F8] Buffs  [F9] Quick  [PGUP] Skills  [END] Hide")
 	lines = append(lines, fmt.Sprintf("Quick:%s (%s)", quickStatus, quickPreset))
 
