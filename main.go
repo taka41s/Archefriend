@@ -4,6 +4,7 @@ package main
 
 import (
 	"archefriend/afk"
+	"archefriend/bot"
 	"archefriend/buff"
 	"archefriend/config"
 	"archefriend/entity"
@@ -12,6 +13,7 @@ import (
 	"archefriend/input"
 	"archefriend/loot"
 	"archefriend/monitor"
+	"archefriend/patch"
 	"archefriend/process"
 	"archefriend/reaction"
 	"archefriend/skill"
@@ -35,8 +37,10 @@ type App struct {
 	x2game    uintptr
 	connected bool
 	mu        sync.RWMutex
-	pid       uint32 // PID do ArcheAge
-	gameHwnd  uintptr // Handle da janela do ArcheAge
+	pid       uint32
+	gameHwnd  uintptr
+
+	patchManager    *patch.Manager
 
 	lootBypass      *loot.Bypass
 	inputManager    *input.Manager
@@ -53,11 +57,16 @@ type App struct {
 	keybinds             *config.KeybindsConfig
 	targetScanner        *esp.TargetScanner
 
+	// Bot
+	botInstance  *bot.Bot
+	botConfig    *bot.FileConfig
+
 	window            *gui.OverlayWindow
 	configWindow      *gui.ConfigWindow
 	buffWindow        *gui.BuffWindow
 	skillConfigWindow *gui.SkillConfigWindow
 	autospamWindow    *gui.AutoSpamWindow
+	botConfigWindow   *gui.BotConfigWindow
 	visible           bool
 	keyStates    map[int]bool
 	frameCount   int
@@ -102,6 +111,10 @@ func NewApp() (*App, error) {
 	app.x2game = x2game
 	app.pid = pid
 	app.connected = true
+
+	// Aplicar patches de mount + GCD
+	app.patchManager = patch.NewManager(handle, x2game)
+	app.patchManager.ApplyAll()
 
 	// Encontrar janela do ArcheAge usando o PID
 	app.gameHwnd = findWindowByPID(pid)
@@ -156,6 +169,11 @@ func NewApp() (*App, error) {
 		fmt.Println("[ESP] Target ESP e All Entities ESP iniciados automaticamente")
 	}
 
+	// ============================
+	// Bot setup
+	// ============================
+	app.initBot()
+
 	// Create Skill monitor (offset 0x569E1A para hook de skill success)
 	app.skillMonitor = skill.NewSkillMonitor(handle, x2game, 0x569E1A)
 	if err := app.skillMonitor.LoadConfig("skills.json"); err != nil {
@@ -200,13 +218,6 @@ func NewApp() (*App, error) {
 		app.skillReactionManager.OnSkillTry(skillID)
 	}
 
-	// Ativar hook automaticamente
-	// if err := app.skillMonitor.InstallHook(); err != nil {
-	// 	fmt.Printf("[SKILL] Falha ao instalar hook: %v\n", err)
-	// } else {
-	// 	fmt.Println("[SKILL] Monitor de skills ATIVADO")
-	// }
-
 	if err := app.presetManager.LoadFromJSON("buff_presets.json"); err != nil {
 		app.presetManager.CreateDefaultPresets()
 		app.presetManager.SaveToJSON("buff_presets.json")
@@ -236,6 +247,15 @@ func NewApp() (*App, error) {
 		app.autospamWindow = autospamWindow
 	}
 
+	// Bot config window
+	botConfigWindow, err := gui.NewBotConfigWindow(app.botInstance, app.botConfig, "bot_config.json")
+	if err == nil {
+		app.botConfigWindow = botConfigWindow
+		app.botConfigWindow.OnToggleBot = func() {
+			app.toggleBot()
+		}
+	}
+
 	// Setup reaction callbacks
 	app.buffMonitor.OnBuffGained = func(buff monitor.BuffInfo) {
 		app.reactionManager.OnBuffGained(buff.ID)
@@ -255,6 +275,167 @@ func NewApp() (*App, error) {
 
 	return app, nil
 }
+
+// ============================================================================
+// Bot
+// ============================================================================
+
+func (app *App) initBot() {
+	if app.espManager == nil {
+		fmt.Println("[BOT] ESP não disponível, bot desabilitado")
+		return
+	}
+
+	// Carregar config do arquivo (mob names, range, presets)
+	fc, err := bot.LoadFileConfig("bot_config.json")
+	if err != nil {
+		fmt.Printf("[BOT] Config não encontrada, criando padrão\n")
+		bot.SaveDefaultConfig("bot_config.json")
+		fc2 := bot.DefaultFileConfig()
+		fc = &fc2
+	}
+	app.botConfig = fc
+
+	// Adapter: converte esp.EntityInfo -> bot.EntityInfo
+	// Também sincroniza range com o overlay ESP
+	adapter := &bot.ESPAdapter{
+		GetEntitiesFn: func() []bot.EntityInfo {
+			entities := app.espManager.GetAllEntitiesCached()
+			result := make([]bot.EntityInfo, 0, len(entities))
+			for _, e := range entities {
+				result = append(result, bot.EntityInfo{
+					Address:  e.Address,
+					EntityID: e.EntityID,
+					Name:     e.Name,
+					PosX:     e.PosX,
+					PosY:     e.PosY,
+					PosZ:     e.PosZ,
+					HP:       e.HP,
+					MaxHP:    e.MaxHP,
+					Distance: e.Distance,
+					IsPlayer: e.IsPlayer,
+					IsNPC:    e.IsNPC,
+					IsMate:   e.IsMate,
+				})
+			}
+			return result
+		},
+		// Sincroniza range do bot com range do ESP overlay
+		GetRangeFn: func() float32 {
+			return app.espManager.GetAllEntitiesMaxRange()
+		},
+	}
+
+	cfg := bot.DefaultConfig()
+	cfg.MobNames = fc.MobNames
+	cfg.MaxRange = fc.MaxRange
+	cfg.PartialMatch = fc.PartialMatch
+
+	if fc.ScanIntervalMs > 0 {
+		cfg.ScanInterval = time.Duration(fc.ScanIntervalMs) * time.Millisecond
+	}
+	if fc.TargetDelayMs > 0 {
+		cfg.TargetDelay = time.Duration(fc.TargetDelayMs) * time.Millisecond
+	}
+
+	cfg.OnTargetDead = func(t bot.EntityInfo) {
+		fmt.Printf("[BOT] Killed: %s → scanning next...\n", t.Name)
+	}
+
+	cfg.OnTargetAcquired = func(t bot.EntityInfo) {
+		fmt.Printf("[BOT] Attacking: %s (HP:%d Dist:%.0fm)\n", t.Name, t.HP, t.Distance)
+	}
+
+	cfg.OnCombatTick = func(t bot.EntityInfo) {
+		// Auto-attack handled by bot internally
+	}
+
+	// Configurar keys de ataque/loot
+	cfg.AttackKey = fc.AttackKey
+	cfg.LootKey = fc.LootKey
+	cfg.AutoAttack = fc.AutoAttack
+	cfg.AutoLoot = fc.AutoLoot
+	if fc.AttackDelay > 0 {
+		cfg.AttackDelay = time.Duration(fc.AttackDelay) * time.Millisecond
+	}
+	if fc.LootDelay > 0 {
+		cfg.LootDelay = time.Duration(fc.LootDelay) * time.Millisecond
+	}
+
+	// Key sender function - usa PostMessage para enviar direto pro jogo (como o keyspam)
+	cfg.SendKey = func(keyStr string) {
+		if app.gameHwnd == 0 {
+			// Fallback para SendInput se não tiver janela do jogo
+			keys, err := input.ParseKeyString(keyStr)
+			if err != nil {
+				fmt.Printf("[BOT] Invalid key: %s - %v\n", keyStr, err)
+				return
+			}
+			if err := input.SendKeyCombo(keys); err != nil {
+				fmt.Printf("[BOT] SendKey failed: %v\n", err)
+			}
+			return
+		}
+		// Envia direto pro jogo via PostMessage (mesmo método do keyspam)
+		if err := input.SendKeyStringToWindow(app.gameHwnd, keyStr); err != nil {
+			fmt.Printf("[BOT] SendKey failed: %v\n", err)
+		}
+	}
+
+	app.botInstance = bot.New(app.handle, app.x2game, adapter, cfg)
+	fmt.Printf("[BOT] Initialized | Mobs: %v | Range: %.0fm | Attack: %s | Loot: %s\n",
+		fc.MobNames, fc.MaxRange, fc.AttackKey, fc.LootKey)
+}
+
+func (app *App) toggleBot() {
+	if app.botInstance == nil {
+		return
+	}
+
+	if app.botInstance.IsRunning() {
+		app.botInstance.Stop()
+	} else {
+		// Garante que AllEntities ESP tá rodando
+		if app.espManager != nil && !app.espManager.IsAllEntitiesEnabled() {
+			app.espManager.ToggleAllEntities()
+			fmt.Println("[BOT] All Entities ESP ativado automaticamente")
+		}
+		app.botInstance.Start()
+	}
+}
+
+func (app *App) botLoadPreset(presetName string) {
+	if app.botInstance == nil || app.botConfig == nil {
+		return
+	}
+
+	names, ok := app.botConfig.Presets[presetName]
+	if !ok {
+		fmt.Printf("[BOT] Preset '%s' não encontrado\n", presetName)
+		return
+	}
+
+	app.botInstance.SetMobNames(names)
+	fmt.Printf("[BOT] Preset '%s': %v\n", presetName, names)
+}
+
+func (app *App) botReloadConfig() {
+	fc, err := bot.LoadFileConfig("bot_config.json")
+	if err != nil {
+		fmt.Printf("[BOT] Erro ao recarregar config: %v\n", err)
+		return
+	}
+	app.botConfig = fc
+
+	if app.botInstance != nil {
+		app.botInstance.ApplyFileConfig(fc)
+		fmt.Println("[BOT] Config recarregada")
+	}
+}
+
+// ============================================================================
+// Background tasks
+// ============================================================================
 
 func (app *App) startBackgroundTasks() {
 	now := time.Now()
@@ -336,7 +517,6 @@ func (app *App) monitorLoop() {
 
 				// Update target monitor
 				if app.targetMonitor != nil {
-					// Obter posição do player para calcular distância
 					player := entity.GetLocalPlayer(app.handle, app.x2game)
 					app.targetMonitor.Update(player.PosX, player.PosY, player.PosZ)
 				}
@@ -374,6 +554,10 @@ func (app *App) watchdogLoop() {
 		}
 	}
 }
+
+// ============================================================================
+// Hotkeys
+// ============================================================================
 
 func (app *App) pollHotkeys() {
 	user32 := windows.NewLazyDLL("user32.dll")
@@ -431,9 +615,9 @@ func (app *App) pollHotkeys() {
 				app.presetManager.ToggleQuickAction()
 			}
 		},
-		0x79: func() { // F10
-			if app.afkMonitor != nil {
-				app.afkMonitor.Toggle()
+		0x79: func() { // F10 - Bot Config Window
+			if app.botConfigWindow != nil {
+				app.botConfigWindow.Toggle()
 			}
 		},
 		0x2D: func() { // INSERT - AutoSpam Config
@@ -491,18 +675,6 @@ func (app *App) pollHotkeys() {
 				_ = style
 			}
 		},
-		0x22: func() { // PAGE DOWN - Aim once
-			if app.espManager != nil && app.espManager.IsEnabled() {
-				if app.espManager.AimAtTarget() {
-					fmt.Println("[ESP] Aimed at target")
-				}
-			}
-		},
-		0x21: func() { // PAGE UP - Skill Config Window
-			if app.skillConfigWindow != nil {
-				app.skillConfigWindow.Toggle()
-			}
-		},
 		0x91: func() { // SCROLL LOCK - Start/Stop Target Scanner
 			if app.targetScanner != nil {
 				if app.targetScanner.IsScanning() {
@@ -514,15 +686,54 @@ func (app *App) pollHotkeys() {
 				}
 			}
 		},
-		0x13: func() { // PAUSE - Trigger scan (pressione quando mudar de target)
+		0x13: func() { // PAUSE - Trigger scan
 			if app.targetScanner != nil && app.targetScanner.IsScanning() {
 				app.targetScanner.ScanForChanges("TARGET_CHANGE")
 			}
 		},
-		0x2E: func() { // DELETE - Dump full memory region
-			if app.targetScanner != nil && app.targetScanner.IsScanning() {
-				app.targetScanner.DumpRegion()
-				fmt.Println("[SCANNER] Memory dump salvo!")
+		0x2E: func() { // DELETE - Toggle Bot ON/OFF
+			app.toggleBot()
+		},
+
+		// ==================== BOT HOTKEYS ====================
+		0x60: func() { // NUMPAD0 - Toggle Bot ON/OFF
+			app.toggleBot()
+		},
+		0x61: func() { // NUMPAD1 - Preset 1
+			app.botLoadPreset("preset1")
+		},
+		0x62: func() { // NUMPAD2 - Preset 2
+			app.botLoadPreset("preset2")
+		},
+		0x63: func() { // NUMPAD3 - Preset 3
+			app.botLoadPreset("preset3")
+		},
+		0x64: func() { // NUMPAD4 - Reload bot_config.json
+			app.botReloadConfig()
+		},
+		0x6B: func() { // NUMPAD+ - Increase range +5m
+			if app.botInstance != nil {
+				cfg := app.botInstance.GetConfig()
+				app.botInstance.SetMaxRange(cfg.MaxRange + 5)
+			}
+		},
+		0x6D: func() { // NUMPAD- - Decrease range -5m
+			if app.botInstance != nil {
+				cfg := app.botInstance.GetConfig()
+				if cfg.MaxRange > 5 {
+					app.botInstance.SetMaxRange(cfg.MaxRange - 5)
+				}
+			}
+		},
+		0x65: func() { // NUMPAD5 - Toggle partial match
+			if app.botInstance != nil {
+				cfg := app.botInstance.GetConfig()
+				app.botInstance.SetPartialMatch(!cfg.PartialMatch)
+			}
+		},
+		0x69: func() { // NUMPAD9 - Print bot stats
+			if app.botInstance != nil {
+				app.botInstance.PrintStats()
 			}
 		},
 	}
@@ -549,6 +760,10 @@ func (app *App) pollHotkeys() {
 		app.keyStates[vk] = isPressed
 	}
 }
+
+// ============================================================================
+// Display
+// ============================================================================
 
 func (app *App) getDisplayLines() []string {
 	lines := []string{}
@@ -623,17 +838,70 @@ func (app *App) getDisplayLines() []string {
 		allESPStatus = "ON"
 	}
 
+	patchStatus := ""
+	if app.patchManager != nil {
+		patchStatus = app.patchManager.GetStatus()
+	}
+
 	lines = append(lines, fmt.Sprintf("[F1] Loot:%s  [F2] Doodad:%s  [F3] Spam  [F4] AutoSpam:%s", lootStatus, doodadStatus, spamStatus))
-	lines = append(lines, fmt.Sprintf("[F5] Reload  [F6] Reactions:%s  [F10] AFK:%s", reactionStatus, afkStatus))
-	lines = append(lines, fmt.Sprintf("[F12] ESP:%s %s  [PGDN] Aim  [-] AllESP:%s", espStatus, espStyle, allESPStatus))
-	lines = append(lines, "[F7] Config  [F8] Buffs  [F9] Quick  [PGUP] Skills  [END] Hide")
+	lines = append(lines, fmt.Sprintf("[F5] Reload  [F6] Reactions:%s  [F10] AFK:%s  %s", reactionStatus, afkStatus, patchStatus))
+	lines = append(lines, fmt.Sprintf("[F12] ESP:%s %s  [-] AllESP:%s", espStatus, espStyle, allESPStatus))
+	lines = append(lines, "[F7] Config  [F8] Buffs  [F9] Quick  [F10] BotCfg  [DEL] Bot  [END] Hide")
 	lines = append(lines, fmt.Sprintf("Quick:%s (%s)", quickStatus, quickPreset))
+
+	// ==================== BOT STATUS LINE ====================
+	lines = append(lines, "────────────────────────────────────────────────────────")
+	lines = append(lines, app.getBotDisplayLine())
 
 	return lines
 }
 
+func (app *App) getBotDisplayLine() string {
+	if app.botInstance == nil {
+		return "[BOT] N/A (sem ESP)"
+	}
+
+	if !app.botInstance.IsRunning() {
+		// Mostra mob list configurada mesmo quando OFF
+		cfg := app.botInstance.GetConfig()
+		mobList := "none"
+		if len(cfg.MobNames) > 0 {
+			mobList = ""
+			for i, n := range cfg.MobNames {
+				if i > 0 {
+					mobList += ", "
+				}
+				if len(mobList)+len(n) > 50 {
+					mobList += "..."
+					break
+				}
+				mobList += n
+			}
+		}
+		return fmt.Sprintf("[DEL] Bot:OFF | Mobs:[%s] | Range:%.0fm", mobList, cfg.MaxRange)
+	}
+
+	// Bot rodando - mostra estado + target atual
+	state := app.botInstance.GetState()
+	stats := app.botInstance.GetStats()
+	cfg := app.botInstance.GetConfig()
+
+	line := fmt.Sprintf("[DEL] Bot:%s | Kills:%d | R:%.0fm",
+		state, stats.MobsKilled, cfg.MaxRange)
+
+	if target := app.botInstance.GetCurrentTarget(); target != nil {
+		line += fmt.Sprintf(" | %s HP:%d D:%.0fm", target.Name, target.HP, target.Distance)
+	}
+
+	return line
+}
+
 func (app *App) Update() {
 }
+
+// ============================================================================
+// Diagnostics
+// ============================================================================
 
 func (app *App) printDiagnostics() {
 	fmt.Println("\n╔════════════════════════════════════════╗")
@@ -658,6 +926,12 @@ func (app *App) printDiagnostics() {
 	if !connected {
 		fmt.Println("\n  Not connected to ArcheAge!")
 		return
+	}
+
+	// Patch status
+	if app.patchManager != nil {
+		fmt.Printf("\n[PATCHES]\n")
+		fmt.Printf("  %s\n", app.patchManager.GetStatus())
 	}
 
 	playerAddr := entity.GetPlayerEntityAddr(app.handle, app.x2game)
@@ -733,6 +1007,29 @@ func (app *App) printDiagnostics() {
 		}
 	}
 
+	// Bot diagnostics
+	if app.botInstance != nil {
+		fmt.Printf("\n[BOT]\n")
+		fmt.Printf("  Running: %v\n", app.botInstance.IsRunning())
+		fmt.Printf("  State: %s\n", app.botInstance.GetState())
+		cfg := app.botInstance.GetConfig()
+		fmt.Printf("  MobNames: %v\n", cfg.MobNames)
+		fmt.Printf("  MaxRange: %.0fm\n", cfg.MaxRange)
+		fmt.Printf("  PartialMatch: %v\n", cfg.PartialMatch)
+		stats := app.botInstance.GetStats()
+		fmt.Printf("  Kills: %d | Targets: %d\n", stats.MobsKilled, stats.TargetsSet)
+		if target := app.botInstance.GetCurrentTarget(); target != nil {
+			fmt.Printf("  Current: %s (ID:%d HP:%d Dist:%.0fm)\n",
+				target.Name, target.EntityID, target.HP, target.Distance)
+		}
+		if app.botConfig != nil && len(app.botConfig.Presets) > 0 {
+			fmt.Printf("  Presets:\n")
+			for name, mobs := range app.botConfig.Presets {
+				fmt.Printf("    %s: %v\n", name, mobs)
+			}
+		}
+	}
+
 	if app.espManager != nil {
 		fmt.Printf("\n[ESP TARGET DEBUG]\n")
 		app.espManager.DebugTargetInfo()
@@ -754,28 +1051,23 @@ func findWindowByPID(targetPID uint32) uintptr {
 
 	var foundHwnd uintptr
 
-	// Callback para EnumWindows
 	callback := func(hwnd uintptr, lParam uintptr) uintptr {
-		// Verificar se a janela é visível
 		visible, _, _ := procIsWindowVisible.Call(hwnd)
 		if visible == 0 {
-			return 1 // Continuar enumeração
+			return 1
 		}
 
-		// Obter PID da janela
 		var windowPID uint32
 		procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&windowPID)))
 
-		// Se for o PID do ArcheAge, salvar e parar
 		if windowPID == targetPID {
 			foundHwnd = hwnd
-			return 0 // Parar enumeração
+			return 0
 		}
 
-		return 1 // Continuar enumeração
+		return 1
 	}
 
-	// Enumerar todas as janelas
 	procEnumWindows.Call(
 		windows.NewCallback(callback),
 		0,
@@ -786,6 +1078,11 @@ func findWindowByPID(targetPID uint32) uintptr {
 
 func (app *App) Close() {
 	close(app.stopChan)
+
+	// Stop bot
+	if app.botInstance != nil && app.botInstance.IsRunning() {
+		app.botInstance.Stop()
+	}
 
 	if app.inputManager != nil && app.inputManager.IsAutoSpamming() {
 		app.inputManager.StopAutoSpam()
@@ -808,6 +1105,9 @@ func (app *App) Close() {
 	if app.skillMonitor != nil {
 		app.skillMonitor.Close()
 	}
+	if app.patchManager != nil {
+		app.patchManager.RestoreAll()
+	}
 	if app.handle != 0 {
 		windows.CloseHandle(app.handle)
 	}
@@ -817,18 +1117,31 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	fmt.Println("╔═══════════════════════════════════════╗")
-	fmt.Println("║      ARCHEFRIEND OVERLAY v3.5         ║")
+	fmt.Println("║      ARCHEFRIEND OVERLAY v3.7         ║")
 	fmt.Println("╠═══════════════════════════════════════╣")
 	fmt.Println("║  F1: Loot | F2: Doodad | F3: Spam    ║")
 	fmt.Println("║  F4: Auto | F5: Reload | F6: React   ║")
 	fmt.Println("║  F7: Config | F8: Buffs | F9: Quick  ║")
-	fmt.Println("║  F10: AFK | F11: Diag | F12: ESP     ║")
-	fmt.Println("║  PGDN: Aim | HOME: Style | END: Hide ║")
-	fmt.Println("║  PGUP: Skill Config                  ║")
+	fmt.Println("║  F10: BotCfg | F11: Diag | F12: ESP  ║")
+	fmt.Println("║  HOME: Style | END: Hide             ║")
 	fmt.Println("╠═══════════════════════════════════════╣")
-	fmt.Println("║  Aimbot: Config keys (aimbot_config) ║")
+	fmt.Println("║  DEL: Bot ON/OFF                     ║")
+	fmt.Println("║  NUM1-3: Mob Presets | NUM4: Reload  ║")
+	fmt.Println("║  NUM+/-: Range | NUM5: Match Mode    ║")
 	fmt.Println("╚═══════════════════════════════════════╝")
 	fmt.Println()
+
+	// Check admin privileges
+	if !process.IsAdmin() {
+		fmt.Println("╔═══════════════════════════════════════╗")
+		fmt.Println("║  ⚠️  AVISO: NÃO ESTÁ COMO ADMIN!      ║")
+		fmt.Println("║  Bot/SetTarget pode falhar.           ║")
+		fmt.Println("║  Execute como Administrador!          ║")
+		fmt.Println("╚═══════════════════════════════════════╝")
+		fmt.Println()
+	} else {
+		fmt.Println("[OK] Rodando como Administrador")
+	}
 
 	app, err := NewApp()
 	if err != nil {

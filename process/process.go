@@ -8,6 +8,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+var (
+	advapi32              = syscall.NewLazyDLL("advapi32.dll")
+	procOpenProcessToken  = advapi32.NewProc("OpenProcessToken")
+	procGetTokenInformation = advapi32.NewProc("GetTokenInformation")
+)
+
 const (
 	TH32CS_SNAPPROCESS  = 0x2
 	TH32CS_SNAPMODULE   = 0x8
@@ -137,4 +143,18 @@ func OpenProcess(pid uint32) (windows.Handle, error) {
 		return 0, err
 	}
 	return handle, nil
+}
+
+// IsAdmin verifica se o processo está rodando como administrador
+func IsAdmin() bool {
+	var token windows.Token
+	currentProcess, _ := windows.GetCurrentProcess()
+
+	err := windows.OpenProcessToken(currentProcess, windows.TOKEN_QUERY, &token)
+	if err != nil {
+		return false
+	}
+	defer token.Close()
+
+	return token.IsElevated()
 }

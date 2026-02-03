@@ -238,6 +238,7 @@ func (w *OverlayWindow) FindGameWindow() {
 }
 
 // UpdatePosition updates the overlay position to follow the game window
+// Overlay only appears when game window is in foreground
 func (w *OverlayWindow) UpdatePosition() {
 	if w.gameHwnd == 0 {
 		w.FindGameWindow()
@@ -254,13 +255,27 @@ func (w *OverlayWindow) UpdatePosition() {
 		return
 	}
 
+	// Check if game window is foreground
+	fgHwnd, _, _ := procGetForegroundWindow.Call()
+	if fgHwnd != w.gameHwnd {
+		// Game not in foreground - hide overlay
+		procShowWindow.Call(uintptr(w.hwnd), SW_HIDE)
+		return
+	}
+
+	// Game is in foreground - show overlay and position it
+	if w.visible {
+		procShowWindow.Call(uintptr(w.hwnd), SW_SHOW)
+	}
+
 	// Position overlay at top of game window
 	x := rect.Left + 10
 	y := rect.Top + 10
 
+	// Position just above the game window in z-order (not topmost)
 	procSetWindowPos.Call(
 		uintptr(w.hwnd),
-		HWND_TOPMOST,
+		w.gameHwnd, // Insert after game window (appears just above it)
 		uintptr(x),
 		uintptr(y),
 		uintptr(w.width),

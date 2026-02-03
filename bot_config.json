@@ -1,0 +1,26 @@
+{
+  "enabled": false,
+  "mob_names": [
+    "Bluescale Archerfish"
+  ],
+  "max_range": 25,
+  "partial_match": false,
+  "scan_interval_ms": 20,
+  "target_delay_ms": 50,
+  "attack_key": "E",
+  "loot_key": "SHIFT+F",
+  "attack_delay": 500,
+  "loot_delay": 300,
+  "auto_attack": true,
+  "auto_loot": true,
+  "presets": {
+    "preset1": [
+      "Bluescale Archerfish"
+    ],
+    "preset2": [
+      "Wandering Imp",
+      "Forest Spider"
+    ],
+    "preset3": []
+  }
+}

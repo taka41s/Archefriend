@@ -39,6 +39,7 @@ var (
 	procGetWindowTextLength        = user32.NewProc("GetWindowTextLengthW")
 	procEnableWindow               = user32.NewProc("EnableWindow")
 	procSetForegroundWindow        = user32.NewProc("SetForegroundWindow")
+	procGetForegroundWindow        = user32.NewProc("GetForegroundWindow")
 
 	// GDI
 	procCreateFontIndirect   = gdi32.NewProc("CreateFontIndirectW")
@@ -106,9 +107,10 @@ const (
 	SRCCOPY = 0x00CC0020
 
 	// Edit control styles
-	ES_LEFT       = 0x0000
+	ES_LEFT        = 0x0000
 	ES_AUTOHSCROLL = 0x0080
-	ES_MULTILINE  = 0x0004
+	ES_AUTOVSCROLL = 0x0040
+	ES_MULTILINE   = 0x0004
 
 	// Button styles
 	BS_PUSHBUTTON    = 0x00000000

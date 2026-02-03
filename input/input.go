@@ -672,3 +672,94 @@ func SpamKey(keyStr string, count int, interval time.Duration) {
 		}
 	}
 }
+
+// SendKeyComboToWindow envia um combo de teclas diretamente para uma janela específica via PostMessage
+// Usa a mesma lógica do autospam para garantir que o input chegue na janela do jogo
+func SendKeyComboToWindow(hwnd uintptr, keys []uint16) error {
+	if hwnd == 0 {
+		return fmt.Errorf("hwnd inválido")
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	const (
+		WM_KEYDOWN = 0x0100
+		WM_KEYUP   = 0x0101
+	)
+
+	procPostMessage := user32.NewProc("PostMessageW")
+
+	// Enviar todas as teclas DOWN
+	for _, vk := range keys {
+		lParam := makeLParam(vk, false)
+		procPostMessage.Call(hwnd, WM_KEYDOWN, uintptr(vk), lParam)
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+
+	// Enviar todas as teclas UP (ordem reversa)
+	for i := len(keys) - 1; i >= 0; i-- {
+		vk := keys[i]
+		lParam := makeLParam(vk, true)
+		procPostMessage.Call(hwnd, WM_KEYUP, uintptr(vk), lParam)
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return nil
+}
+
+// makeLParam cria o lParam correto para WM_KEYDOWN/WM_KEYUP
+func makeLParam(vk uint16, keyUp bool) uintptr {
+	// Scan codes para teclas comuns
+	scanCodes := map[uint16]uint16{
+		VK_SHIFT:    0x2A,
+		VK_LSHIFT:   0x2A,
+		VK_CONTROL:  0x1D,
+		VK_LCONTROL: 0x1D,
+		VK_ALT:      0x38,
+		VK_LALT:     0x38,
+		VK_F:        0x21,
+		VK_E:        0x12,
+		VK_1:        0x02,
+		VK_2:        0x03,
+		VK_3:        0x04,
+		VK_4:        0x05,
+		VK_5:        0x06,
+		VK_6:        0x07,
+		VK_7:        0x08,
+		VK_8:        0x09,
+		VK_9:        0x0A,
+		VK_0:        0x0B,
+		VK_SPACE:    0x39,
+		VK_RETURN:   0x1C,
+		VK_TAB:      0x0F,
+	}
+
+	scanCode := scanCodes[vk]
+	if scanCode == 0 {
+		// Para letras A-Z, scan code = vk - 0x41 + 0x1E (aproximado)
+		if vk >= VK_A && vk <= VK_Z {
+			scanCode = uint16(vk - VK_A + 0x1E)
+		} else {
+			scanCode = 0x01 // fallback
+		}
+	}
+
+	if keyUp {
+		// Key up: bit 31 = 1, bit 30 = 1
+		return uintptr(0xC0000001 | (uint32(scanCode) << 16))
+	}
+	// Key down: repeat count = 1
+	return uintptr(0x00000001 | (uint32(scanCode) << 16))
+}
+
+// SendKeyStringToWindow parseia uma string de tecla e envia para a janela
+func SendKeyStringToWindow(hwnd uintptr, keyStr string) error {
+	keys, err := ParseKeyString(keyStr)
+	if err != nil {
+		return err
+	}
+	return SendKeyComboToWindow(hwnd, keys)
+}

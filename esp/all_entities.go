@@ -53,8 +53,8 @@ func NewAllEntitiesManager(processHandle uintptr, x2game uintptr, mainManager *M
 		mainManager:   mainManager,
 		enabled:       false,
 		showPlayers:   true,
-		showNPCs:      true,
-		showMates:     true,
+		showNPCs:      false, // Default: only players
+		showMates:     false, // Default: only players
 		maxRange:      200.0,
 		stopChan:      make(chan bool, 1),
 		pauseChan:     make(chan bool, 1),
@@ -77,7 +77,7 @@ func (aem *AllEntitiesManager) Start() {
 	// Inicia goroutine dedicada
 	go aem.updateLoop()
 
-	fmt.Println("[ALL_ENTITIES] Started")
+	fmt.Println("[ALL_ENTITIES] Started (Players only by default)")
 }
 
 // Stop stops All Entities ESP
@@ -204,6 +204,7 @@ func (aem *AllEntitiesManager) GetMaxRange() float32 {
 	return aem.maxRange
 }
 
+
 // updateLoop is the dedicated goroutine that continuously updates the cache
 func (aem *AllEntitiesManager) updateLoop() {
 	aem.running = true
@@ -262,6 +263,7 @@ func (aem *AllEntitiesManager) updateCache() {
 		aem.cacheMutex.Unlock()
 	}
 }
+
 
 // processCollectedEntities processa ActorModel pointers em EntityInfo
 func (aem *AllEntitiesManager) processCollectedEntities(collected map[uint32]bool) []EntityInfo {
@@ -350,20 +352,10 @@ func (aem *AllEntitiesManager) processCollectedEntities(collected map[uint32]boo
 		// Read MaxHP
 		maxHP := aem.mainManager.getMaxHP(entityPtr)
 
-		// Determine type
-		isNPC := len(name) > 0 && (name[0] < 'A' || name[0] > 'Z')
-		if len(name) > 0 {
-			for _, c := range name {
-				if c == ' ' {
-					isNPC = true
-					break
-				}
-			}
-		}
-
-		// Check mate status (simplified)
+		// No filters - show all entities
+		isPlayer := true
+		isNPC := false
 		isMate := false
-		// TODO: Add mate detection logic if needed
 
 		entities = append(entities, EntityInfo{
 			Address:  entityPtr,
@@ -376,7 +368,7 @@ func (aem *AllEntitiesManager) processCollectedEntities(collected map[uint32]boo
 			HP:       hp,
 			MaxHP:    maxHP,
 			Distance: distance,
-			IsPlayer: !isNPC,
+			IsPlayer: isPlayer,
 			IsNPC:    isNPC,
 			IsMate:   isMate,
 		})
