@@ -763,3 +763,18 @@ func SendKeyStringToWindow(hwnd uintptr, keyStr string) error {
 	}
 	return SendKeyComboToWindow(hwnd, keys)
 }
+
+// SendKeySequenceToWindow sends a sequence of combos to the window via PostMessage
+// Each combo is sent with a 50ms delay between them
+func SendKeySequenceToWindow(hwnd uintptr, sequence [][]uint16) error {
+	for i, combo := range sequence {
+		if err := SendKeyComboToWindow(hwnd, combo); err != nil {
+			return fmt.Errorf("combo %d failed: %v", i, err)
+		}
+		// Delay between combos (except after the last one)
+		if i < len(sequence)-1 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	return nil
+}

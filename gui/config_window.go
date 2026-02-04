@@ -25,6 +25,7 @@ const (
 	IDC_EDIT_COOLDOWN = 1010
 	IDC_BUTTON_EDIT = 1011
 	IDC_BUTTON_CLEAR = 1012
+	IDC_BUTTON_TEST = 1013
 )
 
 type ConfigWindow struct {
@@ -44,6 +45,11 @@ type ConfigWindow struct {
 	btnRemove     windows.Handle
 	btnClear      windows.Handle
 	btnSave       windows.Handle
+	btnTest       windows.Handle
+
+	// Callback to test reaction (emulates buff/debuff detection)
+	// Passes the reaction ID to main to trigger via TriggerForTest
+	TestReaction func(id uint32)
 
 	visible bool
 	ready   chan bool
@@ -351,10 +357,21 @@ func (cw *ConfigWindow) createControls() {
 		uintptr(unsafe.Pointer(buttonClass)),
 		uintptr(unsafe.Pointer(btnText)),
 		WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,
-		10, uintptr(y), 410, 35,
+		10, uintptr(y), 200, 35,
 		uintptr(cw.hwnd), IDC_BUTTON_SAVE, hInstance, 0,
 	)
 	cw.btnSave = windows.Handle(hwnd)
+
+	btnText, _ = syscall.UTF16PtrFromString("Test")
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(buttonClass)),
+		uintptr(unsafe.Pointer(btnText)),
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,
+		220, uintptr(y), 200, 35,
+		uintptr(cw.hwnd), IDC_BUTTON_TEST, hInstance, 0,
+	)
+	cw.btnTest = windows.Handle(hwnd)
 
 	// List of reactions (right side)
 	label, _ = syscall.UTF16PtrFromString("═══ REAÇÕES CONFIGURADAS ═══")
@@ -431,6 +448,8 @@ func (cw *ConfigWindow) wndProc(hwnd windows.Handle, msg uint32, wParam, lParam 
 				cw.onRemoveReaction()
 			case IDC_BUTTON_SAVE:
 				cw.onSaveAll()
+			case IDC_BUTTON_TEST:
+				cw.onTestReaction()
 			}
 		}
 
@@ -633,8 +652,47 @@ func (cw *ConfigWindow) onSaveAll() {
 	cw.showMessage("Sucesso", "Todas as reações foram salvas!")
 }
 
+func (cw *ConfigWindow) onTestReaction() {
+	// Get selected index
+	idx, _, _ := procSendMessage.Call(
+		uintptr(cw.listReactions),
+		0x0188, // LB_GETCURSEL
+		0, 0,
+	)
+
+	if idx == 0xFFFFFFFF {
+		cw.showMessage("Error", "Select a reaction to test!")
+		return
+	}
+
+	reactions := cw.reactionManager.GetAllReactions()
+	if int(idx) >= len(reactions) {
+		return
+	}
+
+	r := reactions[idx]
+
+	if r.UseString == "" {
+		cw.showMessage("Error", "Reaction has no OnStart configured!")
+		return
+	}
+
+	// Emulates buff/debuff detection via TriggerForTest
+	if cw.TestReaction != nil {
+		rType := "BUFF"
+		if r.IsDebuff {
+			rType = "DEBUFF"
+		}
+		fmt.Printf("[CONFIG] Emulating %s: %s (ID:%d) -> %s\n", rType, r.Name, r.ID, r.UseString)
+		cw.TestReaction(r.ID)
+		cw.showMessage("Test", fmt.Sprintf("Emulated %s: %s", rType, r.Name))
+	} else {
+		cw.showMessage("Error", "TestReaction callback not set!")
+	}
+}
+
 func (cw *ConfigWindow) getEditText(hwnd windows.Handle) string {
-	// Use GetWindowTextLength para obter o tamanho correto
+	// Use GetWindowTextLength to get the correct length
 	length, _, _ := procGetWindowTextLength.Call(uintptr(hwnd))
 
 	if length == 0 {

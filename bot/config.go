@@ -23,6 +23,15 @@ type FileConfig struct {
 	AutoAttack   bool   `json:"auto_attack"`   // Atacar automaticamente
 	AutoLoot     bool   `json:"auto_loot"`     // Lootar automaticamente
 
+	// Potion settings
+	HPPotionKey       string  `json:"hp_potion_key"`       // Ex: "5", "H"
+	HPPotionThreshold float32 `json:"hp_potion_threshold"` // % HP para usar (ex: 50.0 = 50%)
+	HPPotionEnabled   bool    `json:"hp_potion_enabled"`
+	MPPotionKey       string  `json:"mp_potion_key"`       // Ex: "6", "M"
+	MPPotionThreshold float32 `json:"mp_potion_threshold"` // % Mana para usar
+	MPPotionEnabled   bool    `json:"mp_potion_enabled"`
+	PotionCooldownMs  int     `json:"potion_cooldown_ms"`  // Cooldown em ms (21000 = 21s)
+
 	// Presets de mob lists (troca rápida via hotkey)
 	Presets map[string][]string `json:"presets"`
 }
@@ -41,6 +50,14 @@ func DefaultFileConfig() FileConfig {
 		LootDelay:      300,    // 300ms para lootar após kill
 		AutoAttack:     true,   // Auto-attack ativado por padrão
 		AutoLoot:       true,   // Auto-loot ativado por padrão
+		// Potion defaults
+		HPPotionKey:       "5",     // Tecla padrão HP potion
+		HPPotionThreshold: 50.0,    // Usar quando HP < 50%
+		HPPotionEnabled:   false,   // Desabilitado por padrão
+		MPPotionKey:       "6",     // Tecla padrão MP potion
+		MPPotionThreshold: 30.0,    // Usar quando MP < 30%
+		MPPotionEnabled:   false,   // Desabilitado por padrão
+		PotionCooldownMs:  21000,   // 21 segundos de cooldown
 		Presets: map[string][]string{
 			"preset1": {"Young Flamingo"},
 			"preset2": {"Wandering Imp", "Forest Spider"},
@@ -93,6 +110,12 @@ func (b *Bot) ApplyFileConfig(fc *FileConfig) {
 	}
 	if fc.LootDelay > 0 {
 		b.SetLootDelay(fc.LootDelay)
+	}
+	// Potion settings
+	b.SetHPPotion(fc.HPPotionKey, fc.HPPotionThreshold, fc.HPPotionEnabled)
+	b.SetMPPotion(fc.MPPotionKey, fc.MPPotionThreshold, fc.MPPotionEnabled)
+	if fc.PotionCooldownMs > 0 {
+		b.SetPotionCooldown(fc.PotionCooldownMs)
 	}
 }
 

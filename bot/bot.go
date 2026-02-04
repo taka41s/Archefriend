@@ -134,6 +134,15 @@ type Config struct {
 	AutoAttack   bool          // atacar automaticamente
 	AutoLoot     bool          // lootar automaticamente
 
+	// Potion settings
+	HPPotionKey       string        // tecla HP potion
+	HPPotionThreshold float32       // % HP para usar
+	HPPotionEnabled   bool          // usar HP potion automaticamente
+	MPPotionKey       string        // tecla MP potion
+	MPPotionThreshold float32       // % MP para usar
+	MPPotionEnabled   bool          // usar MP potion automaticamente
+	PotionCooldown    time.Duration // cooldown entre potions (21s)
+
 	// Callbacks (opcionais)
 	OnTargetAcquired func(target EntityInfo)
 	OnTargetDead     func(target EntityInfo)
@@ -141,6 +150,10 @@ type Config struct {
 
 	// Key sender (injetado pelo main)
 	SendKey func(key string)
+
+	// Player stats provider (injetado pelo main)
+	GetPlayerHP func() (current, max uint32) // retorna HP atual e máximo
+	GetPlayerMP func() (current, max uint32) // retorna MP atual e máximo
 }
 
 func DefaultConfig() Config {
@@ -156,6 +169,14 @@ func DefaultConfig() Config {
 		LootDelay:    300 * time.Millisecond,
 		AutoAttack:   true,
 		AutoLoot:     true,
+		// Potion defaults
+		HPPotionKey:       "5",
+		HPPotionThreshold: 50.0,
+		HPPotionEnabled:   false,
+		MPPotionKey:       "6",
+		MPPotionThreshold: 30.0,
+		MPPotionEnabled:   false,
+		PotionCooldown:    21 * time.Second,
 	}
 }
 
@@ -190,6 +211,10 @@ type Bot struct {
 	stopChan        chan struct{}
 	lastAttackTime  time.Time
 	lastLootTime    time.Time
+
+	// Potion cooldown tracking
+	lastHPPotionTime time.Time
+	lastMPPotionTime time.Time
 }
 
 // getEffectiveRange returns the bot's configured range.
@@ -379,6 +404,47 @@ func (b *Bot) SetKeySender(fn func(string)) {
 	b.config.SendKey = fn
 }
 
+func (b *Bot) SetHPPotion(key string, threshold float32, enabled bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config.HPPotionKey = key
+	b.config.HPPotionThreshold = threshold
+	b.config.HPPotionEnabled = enabled
+	if enabled {
+		fmt.Printf("[BOT] HP Potion: %s (< %.0f%%)\n", key, threshold)
+	}
+}
+
+func (b *Bot) SetMPPotion(key string, threshold float32, enabled bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config.MPPotionKey = key
+	b.config.MPPotionThreshold = threshold
+	b.config.MPPotionEnabled = enabled
+	if enabled {
+		fmt.Printf("[BOT] MP Potion: %s (< %.0f%%)\n", key, threshold)
+	}
+}
+
+func (b *Bot) SetPotionCooldown(ms int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config.PotionCooldown = time.Duration(ms) * time.Millisecond
+	fmt.Printf("[BOT] Potion cooldown: %dms\n", ms)
+}
+
+func (b *Bot) SetPlayerHPProvider(fn func() (uint32, uint32)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config.GetPlayerHP = fn
+}
+
+func (b *Bot) SetPlayerMPProvider(fn func() (uint32, uint32)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config.GetPlayerMP = fn
+}
+
 func (b *Bot) GetConfig() Config {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -525,6 +591,9 @@ func (b *Bot) loop() {
 }
 
 func (b *Bot) tick() {
+	// Always check potions regardless of state
+	b.tickPotions()
+
 	b.mu.RLock()
 	state := b.state
 	b.mu.RUnlock()
@@ -538,6 +607,64 @@ func (b *Bot) tick() {
 		b.tickCombat()
 	case StateLooting:
 		b.setState(StateIdle)
+	}
+}
+
+// tickPotions verifica HP/MP e usa potions se necessário
+func (b *Bot) tickPotions() {
+	b.mu.RLock()
+	hpEnabled := b.config.HPPotionEnabled
+	mpEnabled := b.config.MPPotionEnabled
+	hpKey := b.config.HPPotionKey
+	mpKey := b.config.MPPotionKey
+	hpThreshold := b.config.HPPotionThreshold
+	mpThreshold := b.config.MPPotionThreshold
+	cooldown := b.config.PotionCooldown
+	sendKey := b.config.SendKey
+	getHP := b.config.GetPlayerHP
+	getMP := b.config.GetPlayerMP
+	lastHP := b.lastHPPotionTime
+	lastMP := b.lastMPPotionTime
+	b.mu.RUnlock()
+
+	if sendKey == nil {
+		return
+	}
+
+	now := time.Now()
+
+	// Check HP Potion
+	if hpEnabled && getHP != nil && hpKey != "" {
+		if now.Sub(lastHP) >= cooldown {
+			current, max := getHP()
+			if max > 0 {
+				percent := float32(current) / float32(max) * 100
+				if percent < hpThreshold && percent > 0 {
+					sendKeySpam(sendKey, hpKey)
+					b.mu.Lock()
+					b.lastHPPotionTime = now
+					b.mu.Unlock()
+					fmt.Printf("[BOT] HP Potion used (%.0f%% < %.0f%%) [x%d]\n", percent, hpThreshold, KeySpamCount)
+				}
+			}
+		}
+	}
+
+	// Check MP Potion
+	if mpEnabled && getMP != nil && mpKey != "" {
+		if now.Sub(lastMP) >= cooldown {
+			current, max := getMP()
+			if max > 0 {
+				percent := float32(current) / float32(max) * 100
+				if percent < mpThreshold && percent > 0 {
+					sendKeySpam(sendKey, mpKey)
+					b.mu.Lock()
+					b.lastMPPotionTime = now
+					b.mu.Unlock()
+					fmt.Printf("[BOT] MP Potion used (%.0f%% < %.0f%%) [x%d]\n", percent, mpThreshold, KeySpamCount)
+				}
+			}
+		}
 	}
 }
 
@@ -701,10 +828,10 @@ func (b *Bot) tickCombat() {
 		return
 	}
 
-	// Auto-attack: pressiona tecla de ataque periodicamente
+	// Auto-attack: pressiona tecla de ataque periodicamente (keyspam)
 	if autoAttack && sendKey != nil && attackKey != "" {
 		if time.Since(b.lastAttackTime) >= attackDelay {
-			sendKey(attackKey)
+			sendKeySpam(sendKey, attackKey)
 			b.lastAttackTime = time.Now()
 		}
 	}
@@ -754,13 +881,13 @@ func (b *Bot) onMobDead(target EntityInfo) {
 	queueCount := b.GetKillQueueCount()
 	fmt.Printf("[BOT] Killed: %s [Queue remaining: %d]\n", target.Name, queueCount)
 
-	// Auto-loot: pressiona tecla de loot após delay
+	// Auto-loot: pressiona tecla de loot após delay (keyspam)
 	if autoLoot && sendKey != nil && lootKey != "" {
 		go func() {
 			time.Sleep(lootDelay)
-			sendKey(lootKey)
+			sendKeySpam(sendKey, lootKey)
 			b.lastLootTime = time.Now()
-			fmt.Printf("[BOT] Looting: %s\n", target.Name)
+			fmt.Printf("[BOT] Looting: %s [x%d]\n", target.Name, KeySpamCount)
 
 			// Volta pro idle após loot
 			time.Sleep(200 * time.Millisecond)
@@ -888,4 +1015,26 @@ func matchMode(partial bool) string {
 		return "partial"
 	}
 	return "exact"
+}
+
+// ====================
+// Key spam helper
+// ====================
+
+const (
+	KeySpamCount    = 5             // Número de vezes que cada tecla é pressionada
+	KeySpamInterval = 30 * time.Millisecond // Intervalo entre key presses
+)
+
+// sendKeySpam envia uma tecla múltiplas vezes para garantir registro
+func sendKeySpam(sendKey func(string), key string) {
+	if sendKey == nil || key == "" {
+		return
+	}
+	for i := 0; i < KeySpamCount; i++ {
+		sendKey(key)
+		if i < KeySpamCount-1 {
+			time.Sleep(KeySpamInterval)
+		}
+	}
 }

@@ -30,6 +30,11 @@ type AllEntitiesManager struct {
 	showMates   bool
 	maxRange    float32
 
+	// Faction filters
+	showWest   bool
+	showEast   bool
+	showPirate bool
+
 	// Hook state
 	hookInstalled     bool
 	hookBuffer        uintptr
@@ -56,6 +61,9 @@ func NewAllEntitiesManager(processHandle uintptr, x2game uintptr, mainManager *M
 		showNPCs:      false, // Default: only players
 		showMates:     false, // Default: only players
 		maxRange:      200.0,
+		showWest:      true, // Show all factions by default
+		showEast:      true,
+		showPirate:    true,
 		stopChan:      make(chan bool, 1),
 		pauseChan:     make(chan bool, 1),
 		resumeChan:    make(chan bool, 1),
@@ -204,6 +212,74 @@ func (aem *AllEntitiesManager) GetMaxRange() float32 {
 	return aem.maxRange
 }
 
+// ToggleShowWest toggles west faction filter
+func (aem *AllEntitiesManager) ToggleShowWest() bool {
+	aem.mu.Lock()
+	defer aem.mu.Unlock()
+	aem.showWest = !aem.showWest
+	return aem.showWest
+}
+
+// ToggleShowEast toggles east faction filter
+func (aem *AllEntitiesManager) ToggleShowEast() bool {
+	aem.mu.Lock()
+	defer aem.mu.Unlock()
+	aem.showEast = !aem.showEast
+	return aem.showEast
+}
+
+// ToggleShowPirate toggles pirate faction filter
+func (aem *AllEntitiesManager) ToggleShowPirate() bool {
+	aem.mu.Lock()
+	defer aem.mu.Unlock()
+	aem.showPirate = !aem.showPirate
+	return aem.showPirate
+}
+
+// GetFactionFilters returns current faction filter states
+func (aem *AllEntitiesManager) GetFactionFilters() (west, east, pirate bool) {
+	aem.mu.Lock()
+	defer aem.mu.Unlock()
+	return aem.showWest, aem.showEast, aem.showPirate
+}
+
+// getRaceAndFaction reads race string from E+0x370 and determines faction
+func (aem *AllEntitiesManager) getRaceAndFaction(entityPtr uint32) (race, faction string) {
+	// Read race string from offset 0x370 (format: "foley_<race>")
+	raceData := make([]byte, 32)
+	aem.mainManager.readBytes(uintptr(entityPtr+0x370), raceData)
+
+	// Parse string until null terminator
+	raceStr := ""
+	for _, b := range raceData {
+		if b == 0 {
+			break
+		}
+		raceStr += string(b)
+	}
+
+	// Extract race from "foley_<race>" format
+	if len(raceStr) > 6 && raceStr[:6] == "foley_" {
+		race = raceStr[6:]
+	} else {
+		race = raceStr
+	}
+
+	// Determine faction based on race
+	switch race {
+	case "nuian", "elf", "dwarf":
+		faction = "west"
+	case "hariharan", "firran", "ferre", "returned", "warborn":
+		faction = "east"
+	case "player":
+		// "foley_player" = humanoid NPC, not a real player
+		faction = "npc"
+	default:
+		faction = "unknown"
+	}
+
+	return race, faction
+}
 
 // updateLoop is the dedicated goroutine that continuously updates the cache
 func (aem *AllEntitiesManager) updateLoop() {
@@ -352,25 +428,54 @@ func (aem *AllEntitiesManager) processCollectedEntities(collected map[uint32]boo
 		// Read MaxHP
 		maxHP := aem.mainManager.getMaxHP(entityPtr)
 
-		// No filters - show all entities
-		isPlayer := true
-		isNPC := false
-		isMate := false
+		// Detect entity type using discovered offsets
+		// AM+0x14: 0x04 = NPC, 0x00 = Player/Mount
+		// E+0x00 (VTable): 0x39D0DF00 = Mount (different from player/npc)
+		actorModelType := aem.mainManager.readU32(uintptr(actorModel + 0x14))
+		entityVTable := aem.mainManager.readU32(uintptr(entityPtr))
+
+		isNPC := actorModelType == 0x04
+		isMate := false // Mount detection: VTable ends differently
+		isPlayer := !isNPC
+
+		// Check for mount by VTable pattern (lower byte differs)
+		// Player/NPC VTable: 0x39D0EA00, Mount VTable: 0x39D0DF00
+		vtableLowByte := (entityVTable >> 8) & 0xFF
+		if vtableLowByte == 0xDF {
+			isMate = true
+			isPlayer = false
+			isNPC = false
+		}
+
+		// Read race string from E+0x370 (format: "foley_<race>")
+		race := ""
+		faction := ""
+		if isPlayer {
+			race, faction = aem.getRaceAndFaction(entityPtr)
+			// "foley_player" means humanoid NPC, not a real player
+			if faction == "npc" {
+				isPlayer = false
+				isNPC = true
+			}
+		}
 
 		entities = append(entities, EntityInfo{
-			Address:  entityPtr,
-			VTable:   0,
-			EntityID: unitId,
-			Name:     name,
-			PosX:     posX,
-			PosY:     posY,
-			PosZ:     posZ,
-			HP:       hp,
-			MaxHP:    maxHP,
-			Distance: distance,
-			IsPlayer: isPlayer,
-			IsNPC:    isNPC,
-			IsMate:   isMate,
+			Address:        entityPtr,
+			ActorModelAddr: actorModel,
+			VTable:         0,
+			EntityID:       unitId,
+			Name:           name,
+			PosX:           posX,
+			PosY:           posY,
+			PosZ:           posZ,
+			HP:             hp,
+			MaxHP:          maxHP,
+			Distance:       distance,
+			IsPlayer:       isPlayer,
+			IsNPC:          isNPC,
+			IsMate:         isMate,
+			Race:           race,
+			Faction:        faction,
 		})
 	}
 

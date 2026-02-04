@@ -136,6 +136,14 @@
     "cooldownMs": 1000
   },
   {
+    "type": 8000033,
+    "name": "sloth",
+    "onStart": "SHIFT+5 \u0026 R",
+    "onEnd": "",
+    "isDebuff": false,
+    "cooldownMs": 1000
+  },
+  {
     "type": 8000074,
     "name": "ezi",
     "onStart": "LSHIFT+4",

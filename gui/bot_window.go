@@ -27,6 +27,13 @@ const (
 	IDC_BOT_EDIT_LOOT_KEY   = 2011
 	IDC_BOT_CHECK_AUTOATTACK= 2012
 	IDC_BOT_CHECK_AUTOLOOT  = 2013
+	// Potion controls
+	IDC_BOT_EDIT_HP_POT_KEY     = 2014
+	IDC_BOT_EDIT_HP_POT_THRESH  = 2015
+	IDC_BOT_CHECK_HP_POT        = 2016
+	IDC_BOT_EDIT_MP_POT_KEY     = 2017
+	IDC_BOT_EDIT_MP_POT_THRESH  = 2018
+	IDC_BOT_CHECK_MP_POT        = 2019
 )
 
 type BotConfigWindow struct {
@@ -46,6 +53,14 @@ type BotConfigWindow struct {
 	btnSave        windows.Handle
 	btnStart       windows.Handle
 	btnLoad        windows.Handle
+
+	// Potion controls
+	editHPPotKey    windows.Handle
+	editHPPotThresh windows.Handle
+	checkHPPot      windows.Handle
+	editMPPotKey    windows.Handle
+	editMPPotThresh windows.Handle
+	checkMPPot      windows.Handle
 
 	visible bool
 	ready   chan bool
@@ -107,7 +122,7 @@ func (bw *BotConfigWindow) runWindow() {
 		uintptr(unsafe.Pointer(windowName)),
 		WS_OVERLAPPEDWINDOW,
 		100, 100,
-		500, 520,
+		500, 650, // Increased height for potion controls
 		0, 0,
 		hInstance,
 		0,
@@ -353,6 +368,144 @@ func (bw *BotConfigWindow) createControls() {
 	bw.checkAutoLoot = windows.Handle(hwnd)
 	y += 35
 
+	// === Potion Settings ===
+	label, _ = syscall.UTF16PtrFromString("═══ POTIONS ═══")
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(label)),
+		WS_CHILD|WS_VISIBLE,
+		10, uintptr(y), 200, 20,
+		uintptr(bw.hwnd), 0, hInstance, 0,
+	)
+	y += 25
+
+	// HP Potion: [checkbox] Key: [edit] Threshold: [edit]%
+	checkText, _ = syscall.UTF16PtrFromString("HP Pot")
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(buttonClass)),
+		uintptr(unsafe.Pointer(checkText)),
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|0x00000003,
+		10, uintptr(y), 70, 22,
+		uintptr(bw.hwnd), IDC_BOT_CHECK_HP_POT, hInstance, 0,
+	)
+	bw.checkHPPot = windows.Handle(hwnd)
+
+	label, _ = syscall.UTF16PtrFromString("Key:")
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(label)),
+		WS_CHILD|WS_VISIBLE,
+		85, uintptr(y+2), 30, 20,
+		uintptr(bw.hwnd), 0, hInstance, 0,
+	)
+
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0x00000200,
+		uintptr(unsafe.Pointer(editClass)),
+		0,
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_LEFT|ES_AUTOHSCROLL,
+		115, uintptr(y), 35, 22,
+		uintptr(bw.hwnd), IDC_BOT_EDIT_HP_POT_KEY, hInstance, 0,
+	)
+	bw.editHPPotKey = windows.Handle(hwnd)
+
+	label, _ = syscall.UTF16PtrFromString("<")
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(label)),
+		WS_CHILD|WS_VISIBLE,
+		155, uintptr(y+2), 15, 20,
+		uintptr(bw.hwnd), 0, hInstance, 0,
+	)
+
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0x00000200,
+		uintptr(unsafe.Pointer(editClass)),
+		0,
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_LEFT|ES_AUTOHSCROLL,
+		170, uintptr(y), 40, 22,
+		uintptr(bw.hwnd), IDC_BOT_EDIT_HP_POT_THRESH, hInstance, 0,
+	)
+	bw.editHPPotThresh = windows.Handle(hwnd)
+
+	label, _ = syscall.UTF16PtrFromString("%")
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(label)),
+		WS_CHILD|WS_VISIBLE,
+		212, uintptr(y+2), 20, 20,
+		uintptr(bw.hwnd), 0, hInstance, 0,
+	)
+	y += 28
+
+	// MP Potion: [checkbox] Key: [edit] Threshold: [edit]%
+	checkText, _ = syscall.UTF16PtrFromString("MP Pot")
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(buttonClass)),
+		uintptr(unsafe.Pointer(checkText)),
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|0x00000003,
+		10, uintptr(y), 70, 22,
+		uintptr(bw.hwnd), IDC_BOT_CHECK_MP_POT, hInstance, 0,
+	)
+	bw.checkMPPot = windows.Handle(hwnd)
+
+	label, _ = syscall.UTF16PtrFromString("Key:")
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(label)),
+		WS_CHILD|WS_VISIBLE,
+		85, uintptr(y+2), 30, 20,
+		uintptr(bw.hwnd), 0, hInstance, 0,
+	)
+
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0x00000200,
+		uintptr(unsafe.Pointer(editClass)),
+		0,
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_LEFT|ES_AUTOHSCROLL,
+		115, uintptr(y), 35, 22,
+		uintptr(bw.hwnd), IDC_BOT_EDIT_MP_POT_KEY, hInstance, 0,
+	)
+	bw.editMPPotKey = windows.Handle(hwnd)
+
+	label, _ = syscall.UTF16PtrFromString("<")
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(label)),
+		WS_CHILD|WS_VISIBLE,
+		155, uintptr(y+2), 15, 20,
+		uintptr(bw.hwnd), 0, hInstance, 0,
+	)
+
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0x00000200,
+		uintptr(unsafe.Pointer(editClass)),
+		0,
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_LEFT|ES_AUTOHSCROLL,
+		170, uintptr(y), 40, 22,
+		uintptr(bw.hwnd), IDC_BOT_EDIT_MP_POT_THRESH, hInstance, 0,
+	)
+	bw.editMPPotThresh = windows.Handle(hwnd)
+
+	label, _ = syscall.UTF16PtrFromString("%")
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(label)),
+		WS_CHILD|WS_VISIBLE,
+		212, uintptr(y+2), 20, 20,
+		uintptr(bw.hwnd), 0, hInstance, 0,
+	)
+	y += 35
+
 	// Buttons
 	btnText, _ := syscall.UTF16PtrFromString("Salvar Config")
 	hwnd, _, _ = procCreateWindowExW.Call(
@@ -458,6 +611,24 @@ func (bw *BotConfigWindow) loadValues() {
 	}
 	procSendMessage.Call(uintptr(bw.checkAutoLoot), 0x00F1, checkValue, 0)
 
+	// HP Potion
+	bw.setEditText(bw.editHPPotKey, bw.botConfig.HPPotionKey)
+	bw.setEditText(bw.editHPPotThresh, fmt.Sprintf("%.0f", bw.botConfig.HPPotionThreshold))
+	checkValue = 0
+	if bw.botConfig.HPPotionEnabled {
+		checkValue = 1
+	}
+	procSendMessage.Call(uintptr(bw.checkHPPot), 0x00F1, checkValue, 0)
+
+	// MP Potion
+	bw.setEditText(bw.editMPPotKey, bw.botConfig.MPPotionKey)
+	bw.setEditText(bw.editMPPotThresh, fmt.Sprintf("%.0f", bw.botConfig.MPPotionThreshold))
+	checkValue = 0
+	if bw.botConfig.MPPotionEnabled {
+		checkValue = 1
+	}
+	procSendMessage.Call(uintptr(bw.checkMPPot), 0x00F1, checkValue, 0)
+
 	// Presets
 	procSendMessage.Call(uintptr(bw.listPresets), 0x0184, 0, 0) // LB_RESETCONTENT
 	for name, mobs := range bw.botConfig.Presets {
@@ -551,6 +722,22 @@ func (bw *BotConfigWindow) onSave() {
 	// Auto-loot
 	ret, _, _ = procSendMessage.Call(uintptr(bw.checkAutoLoot), 0x00F0, 0, 0)
 	bw.botConfig.AutoLoot = ret == 1
+
+	// HP Potion
+	bw.botConfig.HPPotionKey = strings.ToUpper(strings.TrimSpace(bw.getEditText(bw.editHPPotKey)))
+	if t, err := strconv.ParseFloat(bw.getEditText(bw.editHPPotThresh), 32); err == nil {
+		bw.botConfig.HPPotionThreshold = float32(t)
+	}
+	ret, _, _ = procSendMessage.Call(uintptr(bw.checkHPPot), 0x00F0, 0, 0)
+	bw.botConfig.HPPotionEnabled = ret == 1
+
+	// MP Potion
+	bw.botConfig.MPPotionKey = strings.ToUpper(strings.TrimSpace(bw.getEditText(bw.editMPPotKey)))
+	if t, err := strconv.ParseFloat(bw.getEditText(bw.editMPPotThresh), 32); err == nil {
+		bw.botConfig.MPPotionThreshold = float32(t)
+	}
+	ret, _, _ = procSendMessage.Call(uintptr(bw.checkMPPot), 0x00F0, 0, 0)
+	bw.botConfig.MPPotionEnabled = ret == 1
 
 	// Save to file
 	if err := bot.SaveFileConfig(bw.configFile, bw.botConfig); err != nil {

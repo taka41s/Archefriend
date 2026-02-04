@@ -27,6 +27,7 @@ const (
 	IDC_SKILL_BUTTON_TOGGLE   = 2012
 	IDC_SKILL_CHECK_AIMBOT    = 2013
 	IDC_SKILL_CHECK_AIMONTRY  = 2014
+	IDC_SKILL_BUTTON_TEST     = 2015
 )
 
 type SkillConfigWindow struct {
@@ -49,6 +50,10 @@ type SkillConfigWindow struct {
 	btnClear     windows.Handle
 	btnSave      windows.Handle
 	btnToggle    windows.Handle
+	btnTest      windows.Handle
+
+	// Callback to execute OnCast (injected by main)
+	ExecuteOnCast func(onCast string)
 
 	visible bool
 	ready   chan bool
@@ -366,6 +371,17 @@ func (sw *SkillConfigWindow) createControls() {
 		uintptr(sw.hwnd), IDC_SKILL_BUTTON_TOGGLE, hInstance, 0,
 	)
 	sw.btnToggle = windows.Handle(hwnd)
+
+	btnText, _ = syscall.UTF16PtrFromString("Test")
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(buttonClass)),
+		uintptr(unsafe.Pointer(btnText)),
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,
+		230, uintptr(y), 90, 30,
+		uintptr(sw.hwnd), IDC_SKILL_BUTTON_TEST, hInstance, 0,
+	)
+	sw.btnTest = windows.Handle(hwnd)
 	y += 40
 
 	// Save button
@@ -463,6 +479,8 @@ func (sw *SkillConfigWindow) wndProc(hwnd windows.Handle, msg uint32, wParam, lP
 				sw.onSaveAll()
 			case IDC_SKILL_BUTTON_TOGGLE:
 				sw.onToggleReaction()
+			case IDC_SKILL_BUTTON_TEST:
+				sw.onTestReaction()
 			}
 		}
 
@@ -681,6 +699,41 @@ func (sw *SkillConfigWindow) onToggleReaction() {
 		status = "ON"
 	}
 	fmt.Printf("[SKILL-CONFIG] Toggled %s: %s\n", r.Name, status)
+}
+
+func (sw *SkillConfigWindow) onTestReaction() {
+	// Get selected index
+	idx, _, _ := procSendMessage.Call(
+		uintptr(sw.listSkills),
+		0x0188, // LB_GETCURSEL
+		0, 0,
+	)
+
+	if idx == 0xFFFFFFFF {
+		sw.showMessage("Error", "Select a reaction to test!")
+		return
+	}
+
+	reactions := sw.reactionManager.GetAllReactions()
+	if int(idx) >= len(reactions) {
+		return
+	}
+
+	r := reactions[idx]
+
+	if r.OnCast == "" {
+		sw.showMessage("Error", "Reaction has no OnCast action!")
+		return
+	}
+
+	// Execute the OnCast action
+	if sw.ExecuteOnCast != nil {
+		fmt.Printf("[SKILL-CONFIG] Testing reaction: %s -> %s\n", r.Name, r.OnCast)
+		sw.ExecuteOnCast(r.OnCast)
+		sw.showMessage("Test", fmt.Sprintf("Executed: %s", r.OnCast))
+	} else {
+		sw.showMessage("Error", "ExecuteOnCast callback not set!")
+	}
 }
 
 func (sw *SkillConfigWindow) onRemoveReaction() {

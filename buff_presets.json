@@ -6,21 +6,21 @@
       {
         "id": 5909,
         "name": "Swim",
-        "permanent": false,
+        "permanent": true,
         "hidden": false,
         "stack": 0
       },
       {
         "id": 4627,
         "name": "Speed",
-        "permanent": false,
+        "permanent": true,
         "hidden": false,
         "stack": 0
       },
       {
         "id": 8284,
         "name": "Light",
-        "permanent": false,
+        "permanent": true,
         "hidden": false,
         "stack": 0
       }

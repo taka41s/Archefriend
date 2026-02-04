@@ -259,23 +259,32 @@ type Manager struct {
 	rangeIncBtnX int32
 	rangeIncBtnY int32
 	rangeBtnSize int32
+
+	// Faction filter UI (bottom-right)
+	checkboxWestX int32
+	checkboxWestY int32
+	checkboxEastX int32
+	checkboxEastY int32
 }
 
 // EntityInfo stores entity information
 type EntityInfo struct {
-	Address  uint32
-	VTable   uint32
-	EntityID uint32
-	Name     string
-	PosX     float32
-	PosY     float32
-	PosZ     float32
-	HP       uint32
-	MaxHP    uint32
-	IsPlayer bool
-	IsNPC    bool
-	IsMate   bool
-	Distance float32
+	Address        uint32
+	ActorModelAddr uint32 // Address of ActorModel struct
+	VTable         uint32
+	EntityID       uint32
+	Name           string
+	PosX           float32
+	PosY           float32
+	PosZ           float32
+	HP             uint32
+	MaxHP          uint32
+	IsPlayer       bool
+	IsNPC          bool
+	IsMate         bool
+	Distance       float32
+	Race           string // e.g. "elf", "nuian", "hariharan", "firran"
+	Faction        string // "west", "east", "pirate"
 }
 
 func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
@@ -417,6 +426,48 @@ func (m *Manager) allocateShellcode() error {
 	var written uintptr
 	procWriteProcessMemory.Call(m.processHandle, addr, uintptr(unsafe.Pointer(&shellcode[0])), uintptr(len(shellcode)), uintptr(unsafe.Pointer(&written)))
 	return nil
+}
+
+// DumpEntityMemoryCompare dumps entity memory for player vs NPC comparison
+func (m *Manager) DumpEntityMemoryCompare() {
+	if m.allEntitiesManager == nil {
+		fmt.Println("[DUMP] AllEntitiesManager not available")
+		return
+	}
+	m.allEntitiesManager.DumpAndCompare()
+}
+
+// DumpSingleEntity dumps memory of a single entity by address
+func (m *Manager) DumpSingleEntity(entityAddr uint32) *EntityDump {
+	if m.allEntitiesManager == nil {
+		return nil
+	}
+	return m.allEntitiesManager.DumpSingleEntityByAddr(entityAddr)
+}
+
+// DumpEntityMemoryRaw dumps raw memory from entities for classification
+func (m *Manager) DumpEntityMemoryRaw(maxEntities int) []EntityDump {
+	if m.allEntitiesManager == nil {
+		return nil
+	}
+	return m.allEntitiesManager.DumpEntityMemory(maxEntities)
+}
+
+// DumpFactionData dumps faction-related memory to JSON for investigation
+func (m *Manager) DumpFactionData() {
+	if m.allEntitiesManager == nil {
+		fmt.Println("[FACTION] AllEntitiesManager not available")
+		return
+	}
+
+	// First print comparison table to console
+	m.allEntitiesManager.PrintFactionComparison()
+
+	// Then save detailed JSON
+	err := m.allEntitiesManager.SaveFactionDumpToJSON("faction_samples.json")
+	if err != nil {
+		fmt.Printf("[FACTION] Error saving JSON: %v\n", err)
+	}
 }
 
 // Close libera recursos
@@ -883,11 +934,38 @@ func (m *Manager) renderLoop() {
 		if m.allEntitiesManager.IsEnabled() && isVisible != 0 {
 			// Cache is updated in background goroutine (separate module)
 			entities := m.allEntitiesManager.GetCachedEntities()
+			showWest, showEast, showPirate := m.allEntitiesManager.GetFactionFilters()
+			showPlayers := m.allEntitiesManager.GetShowPlayers()
+			showNPCs := m.allEntitiesManager.GetShowNPCs()
+			showMates := m.allEntitiesManager.GetShowMates()
 
-			// Render all entities (no filters)
+			// Render all entities
 			renderedCount := 0
 			skippedOffscreen := 0
 			for _, entity := range entities {
+				// Apply entity type filters
+				if entity.IsPlayer && !showPlayers {
+					continue
+				}
+				if entity.IsNPC && !showNPCs {
+					continue
+				}
+				if entity.IsMate && !showMates {
+					continue
+				}
+
+				// Apply faction filters for players
+				if entity.IsPlayer && entity.Faction != "" {
+					if entity.Faction == "west" && !showWest {
+						continue
+					}
+					if entity.Faction == "east" && !showEast {
+						continue
+					}
+					if entity.Faction == "pirate" && !showPirate {
+						continue
+					}
+				}
 				// WorldToScreen (order: X, Z, Y)
 				screenX, screenY, screenZ := m.WorldToScreen(entity.PosX, entity.PosZ, entity.PosY)
 
@@ -923,7 +1001,17 @@ func (m *Manager) renderLoop() {
 				// Small label with type and distance below the dot
 				entityType := "N" // NPC
 				if entity.IsPlayer {
-					entityType = "P" // Player
+					// Show faction initial: W/E/P
+					switch entity.Faction {
+					case "west":
+						entityType = "W"
+					case "east":
+						entityType = "E"
+					case "pirate":
+						entityType = "P"
+					default:
+						entityType = "?"
+					}
 				} else if entity.IsMate {
 					entityType = "M"
 				}
@@ -939,6 +1027,9 @@ func (m *Manager) renderLoop() {
 			// Debug output (unused)
 			_ = renderedCount
 			_ = skippedOffscreen
+
+			// Draw filter UI panel
+			m.drawFilterUI()
 		}
 
 		// 3. Copy back buffer to screen at once (no flicker)
@@ -1002,6 +1093,18 @@ func (m *Manager) processMouseInput() {
 				fmt.Printf("[UI] Max Range: %.0fm\n", maxRange+25.0)
 			}
 		}
+
+		// Check if click is on West checkbox
+		if m.isPointInCheckbox(pt.X, pt.Y, m.checkboxWestX, m.checkboxWestY) {
+			showWest := m.allEntitiesManager.ToggleShowWest()
+			fmt.Printf("[UI] Show West: %v\n", showWest)
+		}
+
+		// Check if click is on East checkbox
+		if m.isPointInCheckbox(pt.X, pt.Y, m.checkboxEastX, m.checkboxEastY) {
+			showEast := m.allEntitiesManager.ToggleShowEast()
+			fmt.Printf("[UI] Show East: %v\n", showEast)
+		}
 	}
 
 	m.lastMouseState = isPressed
@@ -1026,65 +1129,72 @@ func (m *Manager) isMouseOverUI(px, py int32) bool {
 		return false
 	}
 
-	// UI panel area (top-right corner)
-	startX := m.screenW - 150
-	startY := int32(10)
-	panelX := startX - 5
-	panelY := startY - 5
+	// Bottom-right panel
 	panelW := int32(140)
-	panelH := int32(110)
+	panelH := int32(185)
+	panelX := m.screenW - panelW - 10
+	panelY := m.screenH - panelH - 10
 
 	return px >= panelX && px <= panelX+panelW && py >= panelY && py <= panelY+panelH
 }
 
-// drawFilterUI draws filter checkboxes
+// drawFilterUI draws all filter checkboxes in bottom-right corner
 func (m *Manager) drawFilterUI() {
-	// Position checkboxes in top-right corner
-	startX := m.screenW - 150
-	startY := int32(10)
+	// Panel dimensions
+	panelW := int32(140)
+	panelH := int32(185)
+	panelX := m.screenW - panelW - 10
+	panelY := m.screenH - panelH - 10
+
+	// Starting position for checkboxes (inside panel)
+	startX := panelX + 5
+	startY := panelY + 5
 
 	// Update checkbox positions
 	m.checkboxPlayerX = startX
 	m.checkboxPlayerY = startY
 	m.checkboxNPCX = startX
-	m.checkboxNPCY = startY + 25
+	m.checkboxNPCY = startY + 22
 	m.checkboxMateX = startX
-	m.checkboxMateY = startY + 50
+	m.checkboxMateY = startY + 44
+	m.checkboxWestX = startX
+	m.checkboxWestY = startY + 66
+	m.checkboxEastX = startX
+	m.checkboxEastY = startY + 88
 
 	// Range controls position
-	rangeY := startY + 75
+	rangeY := startY + 115
 	m.rangeDecBtnX = startX
-	m.rangeDecBtnY = rangeY
+	m.rangeDecBtnY = rangeY + 20
 	m.rangeIncBtnX = startX + 100
-	m.rangeIncBtnY = rangeY
+	m.rangeIncBtnY = rangeY + 20
 
 	// Draw semi-transparent background panel
-	panelX := startX - 5
-	panelY := startY - 5
-	panelW := int32(140)
-	panelH := int32(110)
 	m.drawFilledRect(panelX, panelY, panelW, panelH, 0x00000000, 180)
 
-	// Draw Players checkbox and label
+	// Get current filter states
+	showWest, showEast, _ := m.allEntitiesManager.GetFactionFilters()
+
+	// Draw checkboxes
 	m.drawCheckbox(m.checkboxPlayerX, m.checkboxPlayerY, m.allEntitiesManager.GetShowPlayers())
 	m.drawText(m.checkboxPlayerX+m.checkboxSize+5, m.checkboxPlayerY, "Players", COLOR_WHITE)
 
-	// Draw NPCs checkbox and label
 	m.drawCheckbox(m.checkboxNPCX, m.checkboxNPCY, m.allEntitiesManager.GetShowNPCs())
 	m.drawText(m.checkboxNPCX+m.checkboxSize+5, m.checkboxNPCY, "NPCs", COLOR_WHITE)
 
-	// Draw Mates checkbox and label
 	m.drawCheckbox(m.checkboxMateX, m.checkboxMateY, m.allEntitiesManager.GetShowMates())
 	m.drawText(m.checkboxMateX+m.checkboxSize+5, m.checkboxMateY, "Mates", COLOR_WHITE)
 
-	// Draw Range label and value
+	m.drawCheckbox(m.checkboxWestX, m.checkboxWestY, showWest)
+	m.drawText(m.checkboxWestX+m.checkboxSize+5, m.checkboxWestY, "West", COLOR_WHITE)
+
+	m.drawCheckbox(m.checkboxEastX, m.checkboxEastY, showEast)
+	m.drawText(m.checkboxEastX+m.checkboxSize+5, m.checkboxEastY, "East", COLOR_WHITE)
+
+	// Range controls
 	rangeText := fmt.Sprintf("Range: %.0fm", m.allEntitiesManager.GetMaxRange())
-	m.drawText(startX, rangeY-20, rangeText, COLOR_WHITE)
-
-	// Draw Range decrease button (-)
+	m.drawText(startX, rangeY, rangeText, COLOR_WHITE)
 	m.drawButton(m.rangeDecBtnX, m.rangeDecBtnY, m.rangeBtnSize, "-")
-
-	// Draw Range increase button (+)
 	m.drawButton(m.rangeIncBtnX, m.rangeIncBtnY, m.rangeBtnSize, "+")
 }
 
@@ -1242,6 +1352,26 @@ func (m *Manager) ToggleShowMates() bool {
 // GetShowMates returns mates filter state
 func (m *Manager) GetShowMates() bool {
 	return m.allEntitiesManager.GetShowMates()
+}
+
+// ToggleShowWest toggles west faction filter
+func (m *Manager) ToggleShowWest() bool {
+	return m.allEntitiesManager.ToggleShowWest()
+}
+
+// ToggleShowEast toggles east faction filter
+func (m *Manager) ToggleShowEast() bool {
+	return m.allEntitiesManager.ToggleShowEast()
+}
+
+// ToggleShowPirate toggles pirate faction filter
+func (m *Manager) ToggleShowPirate() bool {
+	return m.allEntitiesManager.ToggleShowPirate()
+}
+
+// GetFactionFilters returns faction filter states
+func (m *Manager) GetFactionFilters() (west, east, pirate bool) {
+	return m.allEntitiesManager.GetFactionFilters()
 }
 
 // InstallPersistentHook instala o hook permanente
@@ -1766,6 +1896,12 @@ func (m *Manager) readString(addr uintptr, maxLen int) string {
 		}
 	}
 	return string(buf)
+}
+
+func (m *Manager) readBytes(addr uintptr, buf []byte) bool {
+	var read uintptr
+	ret, _, _ := procReadProcessMemory.Call(m.processHandle, addr, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), uintptr(unsafe.Pointer(&read)))
+	return ret != 0
 }
 
 func (m *Manager) getMaxHP(entityAddr uint32) uint32 {

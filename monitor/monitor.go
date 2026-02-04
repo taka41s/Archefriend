@@ -10,6 +10,20 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// Debug flag para filtro de debuffs
+var DebugDebuffFilter = false
+
+// ToggleDebugDebuffFilter liga/desliga debug de filtro de debuffs
+func ToggleDebugDebuffFilter() bool {
+	DebugDebuffFilter = !DebugDebuffFilter
+	if DebugDebuffFilter {
+		fmt.Println("[DEBUG] Debuff filter debug ENABLED")
+	} else {
+		fmt.Println("[DEBUG] Debuff filter debug DISABLED")
+	}
+	return DebugDebuffFilter
+}
+
 type BuffInfo struct {
 	Index    int
 	ID       uint32
@@ -199,6 +213,9 @@ func (m *BuffMonitor) Update(playerAddr uint32) {
 		if !m.KnownIDs[buffID] {
 			m.KnownIDs[buffID] = true
 
+			// Log buff gained
+			fmt.Printf("[BUFF+] Gained: ID=%d Duration=%dms\n", buffID, duration)
+
 			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
 				m.ReactionHandler.OnBuffGained(buffID)
 			}
@@ -215,6 +232,9 @@ func (m *BuffMonitor) Update(playerAddr uint32) {
 	for id := range m.KnownIDs {
 		if !currentIDs[id] {
 			delete(m.KnownIDs, id)
+
+			// Log buff lost
+			fmt.Printf("[BUFF-] Lost: ID=%d\n", id)
 
 			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
 				m.ReactionHandler.OnBuffLost(id)
@@ -312,7 +332,17 @@ func (m *DebuffMonitor) Update(playerAddr uint32) {
 		durMax := memory.BytesToUint32(m.debuffBuffer[offset+0x30 : offset+0x34])
 		durLeft := memory.BytesToUint32(m.debuffBuffer[offset+0x34 : offset+0x38])
 
-		if id < 1 || id > 50000 || durMax < 1000 || durMax > 300000 {
+		// Debug: mostrar debuffs filtrados
+		if DebugDebuffFilter {
+			if id < 1 || id > 50000 {
+				fmt.Printf("[DEBUFF-FILTER] ID out of range: id=%d typeID=%d durMax=%d\n", id, typeID, durMax)
+			} else if durMax < 500 || durMax > 600000 {
+				fmt.Printf("[DEBUFF-FILTER] Duration out of range: id=%d typeID=%d durMax=%d (%.1fs)\n", id, typeID, durMax, float64(durMax)/1000)
+			}
+		}
+
+		// Filtro mais permissivo: durMax >= 500ms (0.5s) e <= 600000ms (10min)
+		if id < 1 || id > 50000 || durMax < 500 || durMax > 600000 {
 			continue
 		}
 
@@ -330,7 +360,17 @@ func (m *DebuffMonitor) Update(playerAddr uint32) {
 		if !m.KnownIDs[key] {
 			m.KnownIDs[key] = true
 
+			// Log debuff gained
+			fmt.Printf("[DEBUFF+] Gained: ID=%d TypeID=%d Duration=%.1fs\n", id, typeID, float64(durMax)/1000)
+
+			if DebugDebuffFilter {
+				fmt.Printf("[DEBUFF-NEW] Detected: id=%d typeID=%d durMax=%d (%.1fs)\n", id, typeID, durMax, float64(durMax)/1000)
+			}
+
 			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
+				if DebugDebuffFilter {
+					fmt.Printf("[DEBUFF-REACT] Calling OnDebuffGained(typeID=%d)\n", typeID)
+				}
 				m.ReactionHandler.OnDebuffGained(typeID)
 			}
 
@@ -348,6 +388,9 @@ func (m *DebuffMonitor) Update(playerAddr uint32) {
 			delete(m.KnownIDs, key)
 			id := uint32(key >> 32)
 			typeID := uint32(key & 0xFFFFFFFF)
+
+			// Log debuff lost
+			fmt.Printf("[DEBUFF-] Lost: ID=%d TypeID=%d\n", id, typeID)
 
 			if m.ReactionHandler != nil && m.ReactionHandler.IsEnabled() {
 				m.ReactionHandler.OnDebuffLost(typeID)

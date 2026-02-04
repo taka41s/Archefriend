@@ -183,6 +183,19 @@ func (m *Manager) OnBuffLost(buffID uint32) {
 	}()
 }
 
+// Debug flag
+var DebugReaction = false
+
+func ToggleDebugReaction() bool {
+	DebugReaction = !DebugReaction
+	if DebugReaction {
+		fmt.Println("[DEBUG] Reaction debug ENABLED")
+	} else {
+		fmt.Println("[DEBUG] Reaction debug DISABLED")
+	}
+	return DebugReaction
+}
+
 func (m *Manager) OnDebuffGained(debuffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
@@ -190,16 +203,39 @@ func (m *Manager) OnDebuffGained(debuffID uint32) {
 	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
+	if DebugReaction {
+		if !exists {
+			fmt.Printf("[REACT-DBG] debuffID=%d NOT FOUND in reactions map\n", debuffID)
+		} else {
+			fmt.Printf("[REACT-DBG] debuffID=%d FOUND: name=%s enabled=%v isDebuff=%v hasOnGain=%v\n",
+				debuffID, reaction.Name, reaction.Enabled, reaction.IsDebuff, len(reaction.OnGain) > 0)
+		}
+	}
+
 	if !enabled || !exists || !reaction.Enabled || !reaction.IsDebuff {
+		if DebugReaction && exists {
+			fmt.Printf("[REACT-DBG] debuffID=%d SKIPPED: managerEnabled=%v reactionEnabled=%v isDebuff=%v\n",
+				debuffID, enabled, reaction.Enabled, reaction.IsDebuff)
+		}
 		return
 	}
 
 	if afkChecker != nil && afkChecker.IsEnabled() && afkChecker.IsAFK() {
+		if DebugReaction {
+			fmt.Printf("[REACT-DBG] debuffID=%d SKIPPED: AFK\n", debuffID)
+		}
 		return
 	}
 
 	if len(reaction.OnGain) == 0 {
+		if DebugReaction {
+			fmt.Printf("[REACT-DBG] debuffID=%d SKIPPED: no OnGain keys\n", debuffID)
+		}
 		return
+	}
+
+	if DebugReaction {
+		fmt.Printf("[REACT-DBG] debuffID=%d EXECUTING: %s -> %s\n", debuffID, reaction.Name, reaction.UseString)
 	}
 
 	go func() {
@@ -469,4 +505,35 @@ func (m *Manager) RemoveBuffReaction(id uint32) {
 
 func (m *Manager) RemoveDebuffReaction(id uint32) {
 	m.RemoveReaction(id)
+}
+
+// TriggerForTest simulates buff/debuff detection for testing
+// Uses custom keyExecutor (e.g., PostMessage to game window)
+// Ignores AFK check since it's only a test
+func (m *Manager) TriggerForTest(id uint32, keyExecutor func([][]uint16) error) error {
+	m.mu.RLock()
+	reaction, exists := m.reactions[id]
+	m.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("reaction ID %d not found", id)
+	}
+
+	if len(reaction.OnGain) == 0 {
+		return fmt.Errorf("reaction '%s' has no OnStart keys configured", reaction.Name)
+	}
+
+	rType := "BUFF"
+	if reaction.IsDebuff {
+		rType = "DEBUFF"
+	}
+
+	fmt.Printf("[TEST] Emulating %s: %s (ID:%d) -> %s\n", rType, reaction.Name, id, reaction.UseString)
+
+	// Executes via custom keyExecutor (ignores AFK check since it's a test)
+	if err := keyExecutor(reaction.OnGain); err != nil {
+		return fmt.Errorf("failed to execute keys: %v", err)
+	}
+
+	return nil
 }

@@ -230,6 +230,16 @@ func NewApp() (*App, error) {
 	configWindow, err := gui.NewConfigWindow(app.reactionManager)
 	if err == nil {
 		app.configWindow = configWindow
+		// Callback to test reactions via GUI (F7) - emulates buff/debuff detection
+		app.configWindow.TestReaction = func(id uint32) {
+			// Uses TriggerForTest with key executor that sends directly to game window
+			keyExecutor := func(keys [][]uint16) error {
+				return input.SendKeySequenceToWindow(app.gameHwnd, keys)
+			}
+			if err := app.reactionManager.TriggerForTest(id, keyExecutor); err != nil {
+				fmt.Printf("[REACTION-TEST] Error: %v\n", err)
+			}
+		}
 	}
 
 	buffWindow, err := gui.NewBuffWindow(app.buffInjector, app.presetManager)
@@ -240,6 +250,19 @@ func NewApp() (*App, error) {
 	skillConfigWindow, err := gui.NewSkillConfigWindow(app.skillReactionManager, "skill_reactions.json")
 	if err == nil {
 		app.skillConfigWindow = skillConfigWindow
+		// Callback to test reactions via GUI - sends directly to game window
+		app.skillConfigWindow.ExecuteOnCast = func(onCast string) {
+			keys, err := input.ParseKeySequence(onCast)
+			if err != nil {
+				fmt.Printf("[SKILL-TEST] Error parsing '%s': %v\n", onCast, err)
+				return
+			}
+			if err := input.SendKeySequenceToWindow(app.gameHwnd, keys); err != nil {
+				fmt.Printf("[SKILL-TEST] Error sending '%s': %v\n", onCast, err)
+			} else {
+				fmt.Printf("[SKILL-TEST] Sent to game window: %s\n", onCast)
+			}
+		}
 	}
 
 	autospamWindow, err := gui.NewAutoSpamWindow(app.inputManager)
@@ -382,9 +405,39 @@ func (app *App) initBot() {
 		}
 	}
 
+	// Potion settings
+	cfg.HPPotionKey = fc.HPPotionKey
+	cfg.HPPotionThreshold = fc.HPPotionThreshold
+	cfg.HPPotionEnabled = fc.HPPotionEnabled
+	cfg.MPPotionKey = fc.MPPotionKey
+	cfg.MPPotionThreshold = fc.MPPotionThreshold
+	cfg.MPPotionEnabled = fc.MPPotionEnabled
+	if fc.PotionCooldownMs > 0 {
+		cfg.PotionCooldown = time.Duration(fc.PotionCooldownMs) * time.Millisecond
+	}
+
+	// Player HP/MP providers - closure over app to read player stats
+	cfg.GetPlayerHP = func() (uint32, uint32) {
+		player := entity.GetLocalPlayer(app.handle, app.x2game)
+		return player.HP, player.MaxHP
+	}
+	cfg.GetPlayerMP = func() (uint32, uint32) {
+		player := entity.GetLocalPlayer(app.handle, app.x2game)
+		return player.MP, player.MaxMP
+	}
+
 	app.botInstance = bot.New(app.handle, app.x2game, adapter, cfg)
-	fmt.Printf("[BOT] Initialized | Mobs: %v | Range: %.0fm | Attack: %s | Loot: %s\n",
-		fc.MobNames, fc.MaxRange, fc.AttackKey, fc.LootKey)
+
+	// Log potion config if enabled
+	potionInfo := ""
+	if fc.HPPotionEnabled {
+		potionInfo += fmt.Sprintf(" | HP Pot: %s(<%.0f%%)", fc.HPPotionKey, fc.HPPotionThreshold)
+	}
+	if fc.MPPotionEnabled {
+		potionInfo += fmt.Sprintf(" | MP Pot: %s(<%.0f%%)", fc.MPPotionKey, fc.MPPotionThreshold)
+	}
+	fmt.Printf("[BOT] Initialized | Mobs: %v | Range: %.0fm | Attack: %s | Loot: %s%s\n",
+		fc.MobNames, fc.MaxRange, fc.AttackKey, fc.LootKey, potionInfo)
 }
 
 func (app *App) toggleBot() {
