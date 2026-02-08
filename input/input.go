@@ -17,9 +17,19 @@ var (
 )
 
 const (
+	INPUT_MOUSE       = 0
 	INPUT_KEYBOARD    = 1
 	KEYEVENTF_KEYUP   = 0x0002
 	KEYEVENTF_UNICODE = 0x0004
+
+	// Mouse event flags
+	MOUSEEVENTF_WHEEL  = 0x0800
+	MOUSEEVENTF_HWHEEL = 0x1000
+	WHEEL_DELTA        = 120 // Standard wheel delta
+
+	// Special "virtual key" codes for mouse wheel (custom, not real VK codes)
+	VK_MWHEELUP   = 0xFFF0
+	VK_MWHEELDOWN = 0xFFF1
 )
 
 // Virtual Key Codes - Modificadores
@@ -119,11 +129,54 @@ type KEYBDINPUT struct {
 	ExtraInfo uintptr
 }
 
+// MOUSEINPUT representa uma entrada de mouse
+type MOUSEINPUT struct {
+	Dx        int32
+	Dy        int32
+	MouseData uint32
+	Flags     uint32
+	Time      uint32
+	ExtraInfo uintptr
+}
+
 // INPUT representa uma estrutura de input genérica
 type INPUT struct {
 	Type uint32
 	Ki   KEYBDINPUT
 	_    [8]byte // padding para união
+}
+
+// MOUSEINPUTWRAPPER for mouse wheel
+type MOUSEINPUTWRAPPER struct {
+	Type uint32
+	Mi   MOUSEINPUT
+}
+
+// SendMouseWheel sends a mouse wheel event
+// delta > 0 = scroll up, delta < 0 = scroll down
+func SendMouseWheel(delta int32) error {
+	input := MOUSEINPUTWRAPPER{
+		Type: INPUT_MOUSE,
+		Mi: MOUSEINPUT{
+			MouseData: uint32(delta),
+			Flags:     MOUSEEVENTF_WHEEL,
+		},
+	}
+
+	ret, _, _ := procSendInput.Call(
+		1,
+		uintptr(unsafe.Pointer(&input)),
+		unsafe.Sizeof(input),
+	)
+	if ret == 0 {
+		return fmt.Errorf("failed to send mouse wheel")
+	}
+	return nil
+}
+
+// isMouseWheelVK checks if the VK code is a special mouse wheel code
+func isMouseWheelVK(vk uint16) bool {
+	return vk == VK_MWHEELUP || vk == VK_MWHEELDOWN
 }
 
 // SendKey envia um pressionamento de tecla (down + up)
@@ -187,13 +240,27 @@ func SendKeyMultiple(vk uint16, count int, interval time.Duration) error {
 
 // SendKeyCombo envia uma combinação de teclas (ex: ALT+E)
 // Os modificadores devem vir primeiro: [VK_ALT, VK_E]
+// Also supports mouse wheel: MWHEELUP, MWHEELDOWN
 func SendKeyCombo(keys []uint16) error {
 	if len(keys) == 0 {
 		return nil
 	}
 
+	// Check if this is a mouse wheel "combo" (single key, no modifiers)
+	if len(keys) == 1 && isMouseWheelVK(keys[0]) {
+		delta := int32(WHEEL_DELTA)
+		if keys[0] == VK_MWHEELDOWN {
+			delta = -WHEEL_DELTA
+		}
+		return SendMouseWheel(delta)
+	}
+
 	// Press all keys down
 	for _, vk := range keys {
+		// Skip mouse wheel in combos (can't combine with modifiers)
+		if isMouseWheelVK(vk) {
+			continue
+		}
 		input := INPUT{
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
@@ -209,7 +276,7 @@ func SendKeyCombo(keys []uint16) error {
 		if ret == 0 {
 			return fmt.Errorf("falha ao enviar key down para vk %d", vk)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Release all keys up (reverse order)
@@ -229,7 +296,7 @@ func SendKeyCombo(keys []uint16) error {
 		if ret == 0 {
 			return fmt.Errorf("falha ao enviar key up para vk %d", keys[i])
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	return nil
@@ -245,6 +312,30 @@ func SendKeySequence(combos [][]uint16) error {
 		// Delay entre combos
 		if i < len(combos)-1 {
 			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
+// SendKeySequenceSpam envia uma sequência de combos de teclas repetindo N vezes
+// Útil para reactions que precisam de spam para garantir execução
+func SendKeySequenceSpam(combos [][]uint16, repeatCount int) error {
+	if repeatCount < 1 {
+		repeatCount = 1
+	}
+	for r := 0; r < repeatCount; r++ {
+		for i, combo := range combos {
+			if err := SendKeyCombo(combo); err != nil {
+				return fmt.Errorf("falha no combo %d (repeat %d): %v", i, r, err)
+			}
+			// Delay entre combos
+			if i < len(combos)-1 {
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+		// Delay entre repetições
+		if r < repeatCount-1 {
+			time.Sleep(15 * time.Millisecond)
 		}
 	}
 	return nil
@@ -346,6 +437,12 @@ func ParseKeyString(keyStr string) ([]uint16, error) {
 		"END":    VK_END,
 		"PAGEUP": VK_PAGEUP,
 		"PAGEDOWN": VK_PAGEDOWN,
+
+		// Mouse wheel
+		"MWHEELUP":   VK_MWHEELUP,
+		"MWHEELDOWN": VK_MWHEELDOWN,
+		"WHEELUP":    VK_MWHEELUP,
+		"WHEELDOWN":  VK_MWHEELDOWN,
 	}
 
 	// Split por +

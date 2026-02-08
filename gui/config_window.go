@@ -677,15 +677,23 @@ func (cw *ConfigWindow) onTestReaction() {
 		return
 	}
 
-	// Emulates buff/debuff detection via TriggerForTest
+	// Emulates full buff/debuff lifecycle via TriggerForTest (start + 2s delay + end)
 	if cw.TestReaction != nil {
 		rType := "BUFF"
 		if r.IsDebuff {
 			rType = "DEBUFF"
 		}
-		fmt.Printf("[CONFIG] Emulating %s: %s (ID:%d) -> %s\n", rType, r.Name, r.ID, r.UseString)
+		endInfo := ""
+		if r.OnEndString != "" {
+			endInfo = fmt.Sprintf(" | OnEnd(2s): %s", r.OnEndString)
+		}
+		fmt.Printf("[CONFIG] Emulating %s: %s (ID:%d) -> OnStart: %s%s\n", rType, r.Name, r.ID, r.UseString, endInfo)
 		cw.TestReaction(r.ID)
-		cw.showMessage("Test", fmt.Sprintf("Emulated %s: %s", rType, r.Name))
+		msg := fmt.Sprintf("Emulated %s: %s\nOnStart: %s", rType, r.Name, r.UseString)
+		if r.OnEndString != "" {
+			msg += fmt.Sprintf("\nOnEnd (after 2s): %s", r.OnEndString)
+		}
+		cw.showMessage("Test", msg)
 	} else {
 		cw.showMessage("Error", "TestReaction callback not set!")
 	}

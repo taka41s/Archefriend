@@ -31,6 +31,7 @@ var (
 	procVirtualProtectEx         = kernel32.NewProc("VirtualProtectEx")
 	procCreateRemoteThread       = kernel32.NewProc("CreateRemoteThread")
 	procWaitForSingleObject      = kernel32.NewProc("WaitForSingleObject")
+	procBeep                     = kernel32.NewProc("Beep")
 
 	procRegisterClassExW           = user32.NewProc("RegisterClassExW")
 	procCreateWindowExW            = user32.NewProc("CreateWindowExW")
@@ -231,6 +232,9 @@ type Manager struct {
 	// All Entities ESP (separate module)
 	allEntitiesManager *AllEntitiesManager
 
+	// House ESP (separate module)
+	houseManager *HouseESPManager
+
 	// Mutex for WorldToScreen (prevents race condition between ESP and Aimbot)
 	wtsMutex sync.Mutex
 
@@ -265,6 +269,16 @@ type Manager struct {
 	checkboxWestY int32
 	checkboxEastX int32
 	checkboxEastY int32
+
+	// House ESP filter UI (bottom-left)
+	checkboxHouseScannedX   int32
+	checkboxHouseScannedY   int32
+	checkboxHouseUnscannedX int32
+	checkboxHouseUnscannedY int32
+	houseRangeDecBtnX       int32
+	houseRangeDecBtnY       int32
+	houseRangeIncBtnX       int32
+	houseRangeIncBtnY       int32
 }
 
 // EntityInfo stores entity information
@@ -327,6 +341,9 @@ func NewManager(processHandle uintptr, pid uint32, x2game uintptr) (*Manager, er
 
 	// Create separate module for All Entities ESP
 	m.allEntitiesManager = NewAllEntitiesManager(processHandle, x2game, m)
+
+	// Create separate module for House ESP
+	m.houseManager = NewHouseESPManager(m, processHandle, x2game)
 
 	// Allocate shellcode
 	if err := m.allocateShellcode(); err != nil {
@@ -476,6 +493,10 @@ func (m *Manager) Close() {
 	// Stop All Entities ESP if running
 	if m.allEntitiesManager != nil {
 		m.allEntitiesManager.Stop()
+	}
+	// Stop House ESP if running
+	if m.houseManager != nil {
+		m.houseManager.Stop()
 	}
 	if m.font != 0 {
 		procDeleteObject.Call(m.font)
@@ -1032,6 +1053,12 @@ func (m *Manager) renderLoop() {
 			m.drawFilterUI()
 		}
 
+		// House ESP rendering
+		if m.houseManager != nil && m.houseManager.IsEnabled() && isVisible != 0 {
+			m.renderHouses(playerX, playerY, playerZ)
+			m.drawHouseFilterUI()
+		}
+
 		// 3. Copy back buffer to screen at once (no flicker)
 		m.present()
 	}
@@ -1105,6 +1132,32 @@ func (m *Manager) processMouseInput() {
 			showEast := m.allEntitiesManager.ToggleShowEast()
 			fmt.Printf("[UI] Show East: %v\n", showEast)
 		}
+
+		// House ESP checkboxes
+		if m.houseManager != nil && m.houseManager.IsEnabled() {
+			if m.isPointInCheckbox(pt.X, pt.Y, m.checkboxHouseScannedX, m.checkboxHouseScannedY) {
+				v := m.houseManager.ToggleShowScanned()
+				fmt.Printf("[UI] Houses Mapped: %v\n", v)
+			}
+			if m.isPointInCheckbox(pt.X, pt.Y, m.checkboxHouseUnscannedX, m.checkboxHouseUnscannedY) {
+				v := m.houseManager.ToggleShowUnscanned()
+				fmt.Printf("[UI] Houses To Map: %v\n", v)
+			}
+			if m.isPointInButton(pt.X, pt.Y, m.houseRangeDecBtnX, m.houseRangeDecBtnY, m.rangeBtnSize) {
+				r := m.houseManager.GetMaxRange()
+				if r > 100.0 {
+					m.houseManager.SetMaxRange(r - 100.0)
+					fmt.Printf("[UI] Houses Range: %.0fm\n", r-100.0)
+				}
+			}
+			if m.isPointInButton(pt.X, pt.Y, m.houseRangeIncBtnX, m.houseRangeIncBtnY, m.rangeBtnSize) {
+				r := m.houseManager.GetMaxRange()
+				if r < 2000.0 {
+					m.houseManager.SetMaxRange(r + 100.0)
+					fmt.Printf("[UI] Houses Range: %.0fm\n", r+100.0)
+				}
+			}
+		}
 	}
 
 	m.lastMouseState = isPressed
@@ -1125,17 +1178,33 @@ func (m *Manager) isPointInButton(px, py, bx, by, size int32) bool {
 
 // isMouseOverUI checks if mouse is over UI area (filter panel)
 func (m *Manager) isMouseOverUI(px, py int32) bool {
-	if !m.uiVisible || !m.allEntitiesManager.IsEnabled() {
+	if !m.uiVisible {
 		return false
 	}
 
-	// Bottom-right panel
-	panelW := int32(140)
-	panelH := int32(185)
-	panelX := m.screenW - panelW - 10
-	panelY := m.screenH - panelH - 10
+	// Bottom-right panel (entities)
+	if m.allEntitiesManager.IsEnabled() {
+		panelW := int32(140)
+		panelH := int32(185)
+		panelX := m.screenW - panelW - 10
+		panelY := m.screenH - panelH - 10
+		if px >= panelX && px <= panelX+panelW && py >= panelY && py <= panelY+panelH {
+			return true
+		}
+	}
 
-	return px >= panelX && px <= panelX+panelW && py >= panelY && py <= panelY+panelH
+	// Bottom-left panel (houses)
+	if m.houseManager != nil && m.houseManager.IsEnabled() {
+		panelW := int32(150)
+		panelH := int32(120)
+		panelX := int32(10)
+		panelY := m.screenH - panelH - 10
+		if px >= panelX && px <= panelX+panelW && py >= panelY && py <= panelY+panelH {
+			return true
+		}
+	}
+
+	return false
 }
 
 // drawFilterUI draws all filter checkboxes in bottom-right corner
@@ -1374,7 +1443,46 @@ func (m *Manager) GetFactionFilters() (west, east, pirate bool) {
 	return m.allEntitiesManager.GetFactionFilters()
 }
 
-// InstallPersistentHook instala o hook permanente
+// ============================================================================
+// House ESP Methods
+// ============================================================================
+
+// ToggleHouseESP toggles house ESP on/off
+func (m *Manager) ToggleHouseESP() bool {
+	if m.houseManager == nil {
+		return false
+	}
+	enabled := m.houseManager.Toggle()
+	if !enabled {
+		m.setWindowClickable(false)
+	}
+	return enabled
+}
+
+// IsHouseESPEnabled returns if house ESP is enabled
+func (m *Manager) IsHouseESPEnabled() bool {
+	if m.houseManager == nil {
+		return false
+	}
+	return m.houseManager.IsEnabled()
+}
+
+// ReloadHouses reloads houses.json cross-reference data
+func (m *Manager) ReloadHouses() {
+	if m.houseManager == nil {
+		return
+	}
+	m.houseManager.ReloadDB()
+}
+
+// NextHouseFilterType cycles doodad type filter 0→1→...→30→0
+func (m *Manager) NextHouseFilterType() {
+	if m.houseManager == nil {
+		return
+	}
+	m.houseManager.NextFilterType()
+}
+
 // ============================================================================
 // Aimbot Functions
 // ============================================================================

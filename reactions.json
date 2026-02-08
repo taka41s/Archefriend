@@ -18,7 +18,7 @@
   {
     "type": 141,
     "name": "Tripped",
-    "onStart": "F3",
+    "onStart": "ALT+1",
     "onEnd": "",
     "isDebuff": true,
     "cooldownMs": 1000
@@ -66,7 +66,7 @@
   {
     "type": 2458,
     "name": "Snare (charge)",
-    "onStart": "F11",
+    "onStart": "ALT+1 \u0026 ALT+4 \u0026 ALT+1",
     "onEnd": "",
     "isDebuff": true,
     "cooldownMs": 1000
@@ -104,22 +104,6 @@
     "cooldownMs": 1000
   },
   {
-    "type": 13612,
-    "name": "Battle focus",
-    "onStart": "LALT+2",
-    "onEnd": "",
-    "isDebuff": false,
-    "cooldownMs": 1000
-  },
-  {
-    "type": 16842,
-    "name": "Mistsong Nodachi",
-    "onStart": "F12",
-    "onEnd": "",
-    "isDebuff": false,
-    "cooldownMs": 1000
-  },
-  {
     "type": 18396,
     "name": "Skewer",
     "onStart": "F10",
@@ -136,6 +120,14 @@
     "cooldownMs": 1000
   },
   {
+    "type": 800028,
+    "name": "Phoenix",
+    "onStart": "ALT+3",
+    "onEnd": "",
+    "isDebuff": false,
+    "cooldownMs": 1000
+  },
+  {
     "type": 8000033,
     "name": "sloth",
     "onStart": "SHIFT+5 \u0026 R",
@@ -148,6 +140,14 @@
     "name": "ezi",
     "onStart": "LSHIFT+4",
     "onEnd": "",
+    "isDebuff": false,
+    "cooldownMs": 1000
+  },
+  {
+    "type": 8000281,
+    "name": "Phoenix",
+    "onStart": "ALT+3",
+    "onEnd": "R",
     "isDebuff": false,
     "cooldownMs": 1000
   }

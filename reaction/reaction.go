@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
+	"time"
 )
 
 type ReactionConfig struct {
@@ -36,7 +38,8 @@ type AFKChecker interface {
 }
 
 type Manager struct {
-	reactions  map[uint32]*Reaction
+	// Sorted slice for O(log n) binary search - cache friendly
+	sorted     []*Reaction
 	mu         sync.RWMutex
 	cooldown   int64
 	enabled    bool
@@ -45,35 +48,99 @@ type Manager struct {
 
 func NewManager() *Manager {
 	return &Manager{
-		reactions: make(map[uint32]*Reaction),
-		cooldown:  500,
-		enabled:   true,
+		sorted:   make([]*Reaction, 0, 32),
+		cooldown: 500,
+		enabled:  true,
 	}
+}
+
+// fastSearch finds reaction by ID using the fastest algorithm for the list size
+// For small lists (<16): linear search with early exit (better cache/branch prediction)
+// For larger lists: binary search O(log n)
+func (m *Manager) binarySearch(id uint32) (*Reaction, bool) {
+	n := len(m.sorted)
+	if n == 0 {
+		return nil, false
+	}
+
+	// Small list: linear search with early exit (faster due to no branch misprediction)
+	if n < 16 {
+		for i := 0; i < n; i++ {
+			if m.sorted[i].ID == id {
+				return m.sorted[i], true
+			}
+			// Early exit: list is sorted, if we passed the ID it's not here
+			if m.sorted[i].ID > id {
+				return nil, false
+			}
+		}
+		return nil, false
+	}
+
+	// Larger list: binary search
+	left, right := 0, n-1
+	for left <= right {
+		mid := (left + right) >> 1 // bit shift is faster than division
+		midID := m.sorted[mid].ID
+		if midID == id {
+			return m.sorted[mid], true
+		}
+		if midID < id {
+			left = mid + 1
+		} else {
+			right = mid - 1
+		}
+	}
+	return nil, false
+}
+
+// binarySearchIndex finds the index where id should be inserted
+func (m *Manager) binarySearchIndex(id uint32) int {
+	return sort.Search(len(m.sorted), func(i int) bool {
+		return m.sorted[i].ID >= id
+	})
 }
 
 func (m *Manager) AddReaction(r *Reaction) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.reactions[r.ID] = r
+
+	// Find insertion point to maintain sorted order
+	idx := m.binarySearchIndex(r.ID)
+
+	// Check if already exists at this position
+	if idx < len(m.sorted) && m.sorted[idx].ID == r.ID {
+		// Replace existing
+		m.sorted[idx] = r
+		return
+	}
+
+	// Insert at correct position
+	m.sorted = append(m.sorted, nil)
+	copy(m.sorted[idx+1:], m.sorted[idx:])
+	m.sorted[idx] = r
 }
 
 func (m *Manager) RemoveReaction(id uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.reactions, id)
+
+	idx := m.binarySearchIndex(id)
+	if idx < len(m.sorted) && m.sorted[idx].ID == id {
+		m.sorted = append(m.sorted[:idx], m.sorted[idx+1:]...)
+	}
 }
 
 func (m *Manager) GetReaction(id uint32) (*Reaction, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	r, ok := m.reactions[id]
-	return r, ok
+	return m.binarySearch(id)
 }
 
 func (m *Manager) EnableReaction(id uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r, ok := m.reactions[id]; ok {
+	if r, ok := m.binarySearch(id); ok {
 		r.Enabled = true
 	}
 }
@@ -81,7 +148,7 @@ func (m *Manager) EnableReaction(id uint32) {
 func (m *Manager) DisableReaction(id uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r, ok := m.reactions[id]; ok {
+	if r, ok := m.binarySearch(id); ok {
 		r.Enabled = false
 	}
 }
@@ -89,7 +156,7 @@ func (m *Manager) DisableReaction(id uint32) {
 func (m *Manager) ToggleReaction(id uint32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r, ok := m.reactions[id]; ok {
+	if r, ok := m.binarySearch(id); ok {
 		r.Enabled = !r.Enabled
 	}
 }
@@ -138,7 +205,7 @@ func (m *Manager) isAFK() bool {
 func (m *Manager) OnBuffGained(buffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
-	reaction, exists := m.reactions[buffID]
+	reaction, exists := m.binarySearch(buffID)
 	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
@@ -154,15 +221,21 @@ func (m *Manager) OnBuffGained(buffID uint32) {
 		return
 	}
 
+	fmt.Printf("[REACTION] BUFF %s (ID:%d) -> Sending: %s (5x spam)\n", reaction.Name, buffID, reaction.UseString)
+
 	go func() {
-		input.SendKeySequence(reaction.OnGain)
+		if err := input.SendKeySequenceSpam(reaction.OnGain, 5); err != nil {
+			fmt.Printf("[REACTION] ERROR sending keys for %s: %v\n", reaction.Name, err)
+		} else {
+			fmt.Printf("[REACTION] DONE sending keys for %s\n", reaction.Name)
+		}
 	}()
 }
 
 func (m *Manager) OnBuffLost(buffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
-	reaction, exists := m.reactions[buffID]
+	reaction, exists := m.binarySearch(buffID)
 	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
@@ -178,8 +251,14 @@ func (m *Manager) OnBuffLost(buffID uint32) {
 		return
 	}
 
+	fmt.Printf("[REACTION] BUFF LOST %s (ID:%d) -> Sending: %s (5x spam)\n", reaction.Name, buffID, reaction.OnEndString)
+
 	go func() {
-		input.SendKeySequence(reaction.OnLost)
+		if err := input.SendKeySequenceSpam(reaction.OnLost, 5); err != nil {
+			fmt.Printf("[REACTION] ERROR sending keys for %s: %v\n", reaction.Name, err)
+		} else {
+			fmt.Printf("[REACTION] DONE sending keys for %s\n", reaction.Name)
+		}
 	}()
 }
 
@@ -199,7 +278,7 @@ func ToggleDebugReaction() bool {
 func (m *Manager) OnDebuffGained(debuffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
-	reaction, exists := m.reactions[debuffID]
+	reaction, exists := m.binarySearch(debuffID)
 	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
@@ -234,19 +313,21 @@ func (m *Manager) OnDebuffGained(debuffID uint32) {
 		return
 	}
 
-	if DebugReaction {
-		fmt.Printf("[REACT-DBG] debuffID=%d EXECUTING: %s -> %s\n", debuffID, reaction.Name, reaction.UseString)
-	}
+	fmt.Printf("[REACTION] DEBUFF %s (ID:%d) -> Sending: %s (5x spam)\n", reaction.Name, debuffID, reaction.UseString)
 
 	go func() {
-		input.SendKeySequence(reaction.OnGain)
+		if err := input.SendKeySequenceSpam(reaction.OnGain, 5); err != nil {
+			fmt.Printf("[REACTION] ERROR sending keys for %s: %v\n", reaction.Name, err)
+		} else {
+			fmt.Printf("[REACTION] DONE sending keys for %s\n", reaction.Name)
+		}
 	}()
 }
 
 func (m *Manager) OnDebuffLost(debuffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
-	reaction, exists := m.reactions[debuffID]
+	reaction, exists := m.binarySearch(debuffID)
 	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
@@ -262,8 +343,14 @@ func (m *Manager) OnDebuffLost(debuffID uint32) {
 		return
 	}
 
+	fmt.Printf("[REACTION] DEBUFF LOST %s (ID:%d) -> Sending: %s (5x spam)\n", reaction.Name, debuffID, reaction.OnEndString)
+
 	go func() {
-		input.SendKeySequence(reaction.OnLost)
+		if err := input.SendKeySequenceSpam(reaction.OnLost, 5); err != nil {
+			fmt.Printf("[REACTION] ERROR sending keys for %s: %v\n", reaction.Name, err)
+		} else {
+			fmt.Printf("[REACTION] DONE sending keys for %s\n", reaction.Name)
+		}
 	}()
 }
 
@@ -271,20 +358,10 @@ func (m *Manager) GetAllReactions() []*Reaction {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	reactions := make([]*Reaction, 0, len(m.reactions))
-	for _, r := range m.reactions {
-		reactions = append(reactions, r)
-	}
-
-	for i := 0; i < len(reactions)-1; i++ {
-		for j := i + 1; j < len(reactions); j++ {
-			if reactions[i].ID > reactions[j].ID {
-				reactions[i], reactions[j] = reactions[j], reactions[i]
-			}
-		}
-	}
-
-	return reactions
+	// Already sorted, just return a copy
+	result := make([]*Reaction, len(m.sorted))
+	copy(result, m.sorted)
+	return result
 }
 
 func (m *Manager) GetActiveCount() int {
@@ -292,7 +369,7 @@ func (m *Manager) GetActiveCount() int {
 	defer m.mu.RUnlock()
 
 	count := 0
-	for _, r := range m.reactions {
+	for _, r := range m.sorted {
 		if r.Enabled {
 			count++
 		}
@@ -404,20 +481,8 @@ func (m *Manager) SaveToJSON() error {
 
 	configs := []ReactionConfig{}
 
-	reactions := make([]*Reaction, 0, len(m.reactions))
-	for _, r := range m.reactions {
-		reactions = append(reactions, r)
-	}
-
-	for i := 0; i < len(reactions)-1; i++ {
-		for j := i + 1; j < len(reactions); j++ {
-			if reactions[i].ID > reactions[j].ID {
-				reactions[i], reactions[j] = reactions[j], reactions[i]
-			}
-		}
-	}
-
-	for _, r := range reactions {
+	// Already sorted, no need to sort again
+	for _, r := range m.sorted {
 		if r.Enabled {
 			configs = append(configs, ReactionConfig{
 				Type:       int(r.ID),
@@ -444,7 +509,7 @@ func (m *Manager) SaveToJSON() error {
 
 func (m *Manager) ReloadFromJSON() error {
 	m.mu.Lock()
-	m.reactions = make(map[uint32]*Reaction)
+	m.sorted = make([]*Reaction, 0, 32)
 	m.mu.Unlock()
 
 	m.LoadFromJSON("reactions.json")
@@ -507,20 +572,23 @@ func (m *Manager) RemoveDebuffReaction(id uint32) {
 	m.RemoveReaction(id)
 }
 
-// TriggerForTest simulates buff/debuff detection for testing
+// TriggerForTest simulates the full buff/debuff lifecycle for testing:
+// 1. OnStart (gained) -> sends OnGain keys immediately
+// 2. Wait 2 seconds (simulates buff/debuff duration)
+// 3. OnEnd (lost) -> sends OnLost keys
 // Uses custom keyExecutor (e.g., PostMessage to game window)
 // Ignores AFK check since it's only a test
 func (m *Manager) TriggerForTest(id uint32, keyExecutor func([][]uint16) error) error {
 	m.mu.RLock()
-	reaction, exists := m.reactions[id]
+	reaction, exists := m.binarySearch(id)
 	m.mu.RUnlock()
 
 	if !exists {
 		return fmt.Errorf("reaction ID %d not found", id)
 	}
 
-	if len(reaction.OnGain) == 0 {
-		return fmt.Errorf("reaction '%s' has no OnStart keys configured", reaction.Name)
+	if len(reaction.OnGain) == 0 && len(reaction.OnLost) == 0 {
+		return fmt.Errorf("reaction '%s' has no OnStart or OnEnd keys configured", reaction.Name)
 	}
 
 	rType := "BUFF"
@@ -528,11 +596,23 @@ func (m *Manager) TriggerForTest(id uint32, keyExecutor func([][]uint16) error) 
 		rType = "DEBUFF"
 	}
 
-	fmt.Printf("[TEST] Emulating %s: %s (ID:%d) -> %s\n", rType, reaction.Name, id, reaction.UseString)
+	// Phase 1: OnStart (buff/debuff gained)
+	if len(reaction.OnGain) > 0 {
+		fmt.Printf("[TEST] Emulating %s START: %s (ID:%d) -> %s\n", rType, reaction.Name, id, reaction.UseString)
+		if err := keyExecutor(reaction.OnGain); err != nil {
+			return fmt.Errorf("failed to execute OnStart keys: %v", err)
+		}
+	}
 
-	// Executes via custom keyExecutor (ignores AFK check since it's a test)
-	if err := keyExecutor(reaction.OnGain); err != nil {
-		return fmt.Errorf("failed to execute keys: %v", err)
+	// Phase 2: OnEnd (buff/debuff lost) - runs after 2s delay in goroutine
+	if len(reaction.OnLost) > 0 {
+		go func() {
+			time.Sleep(2 * time.Second)
+			fmt.Printf("[TEST] Emulating %s END: %s (ID:%d) -> %s\n", rType, reaction.Name, id, reaction.OnEndString)
+			if err := keyExecutor(reaction.OnLost); err != nil {
+				fmt.Printf("[TEST] Error executing OnEnd keys: %v\n", err)
+			}
+		}()
 	}
 
 	return nil

@@ -528,7 +528,7 @@ func (app *App) hotkeyLoop() {
 }
 
 func (app *App) monitorLoop() {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(1 * time.Millisecond) // 50ms = faster buff/debuff detection
 	defer ticker.Stop()
 
 	for {
@@ -721,6 +721,21 @@ func (app *App) pollHotkeys() {
 				fmt.Printf("[ESP] Show NPCs: %s\n", status)
 			}
 		},
+		0xDD: func() { // CLOSE BRACKET ] - Toggle House ESP
+			if app.espManager != nil {
+				enabled := app.espManager.ToggleHouseESP()
+				status := "OFF"
+				if enabled {
+					status = "ON"
+				}
+				fmt.Printf("[ESP] Houses: %s\n", status)
+			}
+		},
+		0xDE: func() { // ' (single quote) - Next house filter type
+			if app.espManager != nil {
+				app.espManager.NextHouseFilterType()
+			}
+		},
 		0x24: func() { // HOME - Cycle ESP style
 			if app.espManager != nil && app.espManager.IsEnabled() {
 				style := app.espManager.CycleStyle()
@@ -835,7 +850,16 @@ func (app *App) getDisplayLines() []string {
 		activeReactions = app.reactionManager.GetActiveCount()
 	}
 
+	playerPosStr := "N/A"
+	if app.espManager != nil {
+		px, py, pz, ok := app.espManager.GetPlayerPosition()
+		if ok {
+			playerPosStr = fmt.Sprintf("X:%.1f Y:%.1f Z:%.1f", px, py, pz)
+		}
+	}
+
 	lines = append(lines, fmt.Sprintf("ARCHEFRIEND [%s] | Reactions: %d", status, activeReactions))
+	lines = append(lines, fmt.Sprintf("Player: %s", playerPosStr))
 	lines = append(lines, "────────────────────────────────────────────────────────")
 
 	lootStatus := "OFF"
@@ -1092,7 +1116,7 @@ func (app *App) printDiagnostics() {
 
 	fmt.Println("\n════════════════════════════════════════")
 	fmt.Println("Press F11 again to refresh.")
-	fmt.Println("════════════════════════════════════════\n")
+	fmt.Println("════════════════════════════════════════")
 }
 
 // findWindowByPID encontra a janela principal de um processo pelo PID
