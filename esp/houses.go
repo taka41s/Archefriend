@@ -2,10 +2,12 @@ package esp
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -44,6 +46,10 @@ const (
 	OFF_ON_HOUSE_TAX    uintptr = 0x3F9EF0  // OnHouseTaxInfo handler
 	OFF_VTABLE_CS222    uintptr = 0xD352D8  // vtable for CS 222 packet
 
+	// World→Map calibration (game functions, IDA base 0x39000000)
+	OFF_GETPOS_FUNC     uintptr = 0x05A680  // sub_3905A680 (thiscall: get internal position)
+	OFF_WORLD_MGR       uintptr = 0xEA2074  // World/Environment manager ptr
+
 	// Code cave layout
 	CAVE_SIZE           uintptr = 0x8000    // 32KB
 	CAVE_CAPT_COUNT     uintptr = 0x000     // uint32: captured response count
@@ -51,31 +57,44 @@ const (
 	CAVE_SEND_REQ       uintptr = 0x1000    // byte: send request flag
 	CAVE_SEND_RES       uintptr = 0x1001    // byte: send response flag
 	CAVE_SEND_PKT       uintptr = 0x1010    // 64-byte packet buffer
+	CAVE_CAL_REQ        uintptr = 0x1100    // byte: calibration request flag
+	CAVE_CAL_DONE       uintptr = 0x1101    // byte: calibration done flag
+	CAVE_CAL_OUT        uintptr = 0x1104    // 3x float32: map X, Z, Y output
+	CAVE_CAL_TMP        uintptr = 0x1120    // 16-byte temp buffer for getPos
 	CAVE_SEND_CODE      uintptr = 0x1200    // Tick hook shellcode
 	CAVE_LOG_BASE       uintptr = 0x2000    // captured responses (256 × 64 bytes)
 
-	// Auto-scan: only query houses within 15m of player
-	AUTOSCAN_RANGE      float32 = 15.0
+	// Auto-scan: only query houses within 20m of player
+	AUTOSCAN_RANGE      float32 = 17.0
+
+	// MarkerManager (map marker slots) — offsets from x2game.dll base
+	OFF_MARKER_MGR      uintptr = 0x1329518 // MarkerManager static object (IDA 0x3A329518)
 )
 
 // ============================================================================
 // House data structs
 // ============================================================================
 
-// HouseEntry represents a house in houses.json
+// HouseEntry represents a scanned house in the in-memory database
 type HouseEntry struct {
 	TlId      uint32  `json:"tl_id"`
 	ObjId     uint32  `json:"obj_id,omitempty"`
 	X         float32 `json:"x"`
 	Y         float32 `json:"y"`
 	Z         float32 `json:"z"`
+	MapX      float32 `json:"map_x,omitempty"`
+	MapZ      float32 `json:"map_z,omitempty"`
+	Sextant   string  `json:"sextant,omitempty"`
 	Owner     string  `json:"owner,omitempty"`
 	TemplID   uint32  `json:"templ_id,omitempty"`
 	Protected int64   `json:"protected,omitempty"`
 	Deposit   uint32  `json:"deposit,omitempty"`
 	Tax       uint32  `json:"tax,omitempty"`
-	Scanned   bool    `json:"scanned"`
-	ScanTime  int64   `json:"scan_time,omitempty"`
+	Scanned    bool    `json:"scanned"`
+	ScanTime   int64   `json:"scan_time,omitempty"`
+	Demolition bool    `json:"demolition"`
+	RecheckAt  int64   `json:"recheck_at,omitempty"`
+	CS222Raw   string  `json:"cs222_raw,omitempty"`
 }
 
 // HouseDB is the JSON file structure
@@ -109,6 +128,8 @@ type taxData struct {
 	PosX, PosY, PosZ float32
 	ObjId            uint32
 	Owner            string
+	RawResponse      []byte
+	Demolition       bool
 }
 
 // ============================================================================
@@ -137,11 +158,13 @@ type HouseESPManager struct {
 	cachedHouses []HouseRenderInfo
 	cacheMutex   sync.RWMutex
 
-	// houses.json cross-reference
+	// In-memory house database (source of truth, exported to Lua)
+	houseDB        []HouseEntry          // all known houses
 	scannedByObjId map[uint32]*HouseEntry
 	scannedByTlId  map[uint32]*HouseEntry
-	dbFile         string
+	luaExportPath  string // path to export Lua table for addon (e.g. Navigate/data/scan.lua)
 	dbLoaded       bool
+	dbMutex        sync.RWMutex // protects houseDB, scannedByObjId and scannedByTlId
 
 	// Filters
 	showScanned   bool
@@ -164,6 +187,29 @@ type HouseESPManager struct {
 	taxInfo        map[uint32]taxData // TlId → response data
 	taxMutex       sync.Mutex
 	sending        bool               // true while background sender is running
+
+	// World→Map calibration
+	calOffsetX float64
+	calOffsetZ float64
+	calReady   bool
+
+	// All houses cache (used by GetAllDemolitionCount)
+	allHousesCache     []HouseEntry
+	allHousesLastCheck time.Time
+
+	// Recheck panel
+	showRecheckPanel bool
+	recheckCache     []HouseEntry
+	recheckLastCheck time.Time
+	recheckScroll    int
+
+	// Demolition panel
+	showDemolitionPanel bool
+	demolitionDayOffset int       // 0=today, 1=tomorrow, -1=yesterday...
+	demolitionCache     []HouseEntry
+	demolitionCacheDay  int       // cached day offset
+	demolitionLastCheck time.Time
+	demolitionScroll    int
 }
 
 func NewHouseESPManager(mainManager *Manager, processHandle uintptr, x2game uintptr) *HouseESPManager {
@@ -172,7 +218,6 @@ func NewHouseESPManager(mainManager *Manager, processHandle uintptr, x2game uint
 		processHandle:  processHandle,
 		x2game:         x2game,
 		enabled:        false,
-		dbFile:         "houses.json",
 		showScanned:    true,
 		showUnscanned:  true,
 		maxRange:       500.0,
@@ -333,14 +378,70 @@ func (h *HouseESPManager) setupCodeCave() error {
 	sc1 = append(sc1, le32(uint32(jb1))...)
 	h.writeBytes(captCodeAddr, sc1)
 
-	// ── Shellcode 2: Tick hook — send CS 222 ──
+	// ── Shellcode 2: Tick hook — calibration + CS 222 ──
+	realWorldMgr := h.x2game + OFF_WORLD_MGR
+	realGetPos := h.x2game + OFF_GETPOS_FUNC
+	calReqAddr := cave + CAVE_CAL_REQ
+	calDoneAddr := cave + CAVE_CAL_DONE
+	calOutAddr := cave + CAVE_CAL_OUT
+	calTmpAddr := cave + CAVE_CAL_TMP
+
 	sc2 := []byte{}
 	sc2 = append(sc2, 0x9C, 0x60)               // pushfd, pushad
+
+	// === World→Map calibration check ===
+	sc2 = append(sc2, 0x80, 0x3D)               // cmp byte [calReqAddr], 1
+	sc2 = append(sc2, le32(uint32(calReqAddr))...)
+	sc2 = append(sc2, 0x01)
+	sc2 = append(sc2, 0x75, 0x00)               // jne .skipCal (patched below)
+	jneCalPos := len(sc2) - 1
+
+	// Step 1: ECX = *(*netMgr) + 0xFC, call getPos(calTmpAddr)
+	sc2 = append(sc2, 0xA1)                     // mov eax, [realNetMgr]
+	sc2 = append(sc2, le32(uint32(realNetMgr))...)
+	sc2 = append(sc2, 0x8B, 0x00)               // mov eax, [eax]
+	sc2 = append(sc2, 0x8B, 0x88, 0xFC, 0x00, 0x00, 0x00) // mov ecx, [eax+0xFC]
+	sc2 = append(sc2, 0x68)                     // push calTmpAddr
+	sc2 = append(sc2, le32(uint32(calTmpAddr))...)
+	sc2 = append(sc2, 0xB8)                     // mov eax, realGetPos
+	sc2 = append(sc2, le32(uint32(realGetPos))...)
+	sc2 = append(sc2, 0xFF, 0xD0)               // call eax
+
+	// Step 2: obj = *(*worldMgr + 0x84), vtable[10](obj, calTmpAddr)
+	sc2 = append(sc2, 0xA1)                     // mov eax, [realWorldMgr]
+	sc2 = append(sc2, le32(uint32(realWorldMgr))...)
+	sc2 = append(sc2, 0x8B, 0x00)               // mov eax, [eax]
+	sc2 = append(sc2, 0x8B, 0x88, 0x84, 0x00, 0x00, 0x00) // mov ecx, [eax+0x84]
+	sc2 = append(sc2, 0x8B, 0x01)               // mov eax, [ecx] (vtable)
+	sc2 = append(sc2, 0x68)                     // push calTmpAddr
+	sc2 = append(sc2, le32(uint32(calTmpAddr))...)
+	sc2 = append(sc2, 0xFF, 0x50, 0x28)         // call [eax+0x28] (vtable[10])
+
+	// Step 3: copy calTmpAddr → calOutAddr (3 dwords = 12 bytes)
+	sc2 = append(sc2, 0xFC)                     // cld
+	sc2 = append(sc2, 0xBE)                     // mov esi, calTmpAddr
+	sc2 = append(sc2, le32(uint32(calTmpAddr))...)
+	sc2 = append(sc2, 0xBF)                     // mov edi, calOutAddr
+	sc2 = append(sc2, le32(uint32(calOutAddr))...)
+	sc2 = append(sc2, 0xA5, 0xA5, 0xA5)         // movsd ×3
+
+	// req=0, done=1
+	sc2 = append(sc2, 0xC6, 0x05)               // mov byte [calReqAddr], 0
+	sc2 = append(sc2, le32(uint32(calReqAddr))...)
+	sc2 = append(sc2, 0x00)
+	sc2 = append(sc2, 0xC6, 0x05)               // mov byte [calDoneAddr], 1
+	sc2 = append(sc2, le32(uint32(calDoneAddr))...)
+	sc2 = append(sc2, 0x01)
+
+	// .skipCal:
+	sc2[jneCalPos] = byte(len(sc2) - (jneCalPos + 1))
+
+	// === CS 222 send check ===
 	sc2 = append(sc2, 0x80, 0x3D)               // cmp byte [sendReqAddr], 1
 	sc2 = append(sc2, le32(uint32(sendReqAddr))...)
 	sc2 = append(sc2, 0x01)
-	sc2 = append(sc2, 0x75, 0x00)               // jne skip (patched below)
-	jnePos := len(sc2) - 1
+	sc2 = append(sc2, 0x75, 0x00)               // jne .skipSend (patched below)
+	jneSendPos := len(sc2) - 1
 
 	sc2 = append(sc2, 0xC6, 0x05)               // mov byte [sendReqAddr], 0
 	sc2 = append(sc2, le32(uint32(sendReqAddr))...)
@@ -357,7 +458,9 @@ func (h *HouseESPManager) setupCodeCave() error {
 	sc2 = append(sc2, le32(uint32(sendResAddr))...)
 	sc2 = append(sc2, 0x01)
 
-	sc2[jnePos] = byte(len(sc2) - (jnePos + 1)) // patch jne offset
+	// .skipSend:
+	sc2[jneSendPos] = byte(len(sc2) - (jneSendPos + 1))
+
 	sc2 = append(sc2, 0x61, 0x9D)               // popad, popfd
 	sc2 = append(sc2, h.tickOrig...)              // original bytes
 	sc2 = append(sc2, 0xE9)                       // jmp back
@@ -430,6 +533,120 @@ func (h *HouseESPManager) cleanupCodeCave() {
 	}
 }
 
+// calibrateOnce triggers the main code cave's calibration shellcode once
+// to compute the world→map offset. After this, WorldToMap is pure math.
+// Follows mark.go Calibrator pattern: calibrate once, then offset is reused.
+func (h *HouseESPManager) calibrateOnce() error {
+	if h.caveAddr == 0 || !h.tickHooked {
+		return fmt.Errorf("code cave not ready")
+	}
+
+	playerX, _, playerZ, ok := h.mainManager.GetPlayerPosition()
+	if !ok {
+		return fmt.Errorf("no player position")
+	}
+
+	calReqAddr := h.caveAddr + CAVE_CAL_REQ
+	calDoneAddr := h.caveAddr + CAVE_CAL_DONE
+	calOutAddr := h.caveAddr + CAVE_CAL_OUT
+
+	h.writeU8(calDoneAddr, 0)
+	h.writeU8(calReqAddr, 1)
+
+	for i := 0; i < 500; i++ {
+		time.Sleep(10 * time.Millisecond)
+		if h.readU8(calDoneAddr) == 1 {
+			outBuf := make([]byte, 12)
+			if !h.readBytes(calOutAddr, outBuf) {
+				return fmt.Errorf("read output failed")
+			}
+
+			mapX := float64(math.Float32frombits(binary.LittleEndian.Uint32(outBuf[0:4])))
+			mapZ := float64(math.Float32frombits(binary.LittleEndian.Uint32(outBuf[4:8])))
+
+			h.calOffsetX = mapX - float64(playerX)
+			h.calOffsetZ = mapZ - float64(playerZ)
+			h.calReady = true
+
+			fmt.Printf("[MAP] Calibrated: player(%.1f,%.1f) → map(%.1f,%.1f) offset=(%.1f,%.1f)\n",
+				playerX, playerZ, mapX, mapZ, h.calOffsetX, h.calOffsetZ)
+			return nil
+		}
+	}
+	return fmt.Errorf("calibration timeout")
+}
+
+// worldToMapCoords converts world coordinates to map coordinates using calibration offset.
+// Pure math — no shellcode needed. Must call calibrateOnce() first.
+func (h *HouseESPManager) worldToMapCoords(wx, wz float32) (float32, float32) {
+	return float32(float64(wx) + h.calOffsetX), float32(float64(wz) + h.calOffsetZ)
+}
+
+// mapToSextant converts map coordinates to sextant string (e.g. "W 3°12'5\" N 18°7'30\"")
+func mapToSextant(mapX, mapZ float64) string {
+	distX := math.Abs(mapX - 21504.0)
+	degX := int(distX) / 1024
+	remX := (distX - float64(degX)*1024) * 60.0
+	minX := int(remX) / 1024
+	secX := int((remX-float64(minX)*1024)*60.0) / 1024
+
+	distZ := math.Abs(mapZ - 28672.0)
+	degZ := int(distZ) / 1024
+	remZ := (distZ - float64(degZ)*1024) * 60.0
+	minZ := int(remZ) / 1024
+	secZ := int((remZ-float64(minZ)*1024)*60.0) / 1024
+
+	dirX := "W"
+	if mapX >= 21504.0 {
+		dirX = "E"
+	}
+	dirZ := "S"
+	if mapZ >= 28672.0 {
+		dirZ = "N"
+	}
+	return fmt.Sprintf("%s %d*%d'%d\" %s %d*%d'%d\"", dirX, degX, minX, secX, dirZ, degZ, minZ, secZ)
+}
+
+// sextantToMapCoords converts a sextant string to map coordinates using the
+// exact game coefficient (same formula as the game's Lua conversion).
+// Format: "W 3*12'5\" N 18*7'30\""
+func sextantToMapCoords(sextant string) (mapX, mapZ float32, ok bool) {
+	const coordCoef = 0.00097657363894522145695357130138029
+
+	var dirX, dirZ string
+	var degX, minX, secX, degZ, minZ, secZ int
+	n, _ := fmt.Sscanf(sextant, "%s %d*%d'%d\" %s %d*%d'%d\"",
+		&dirX, &degX, &minX, &secX, &dirZ, &degZ, &minZ, &secZ)
+	if n != 8 {
+		return 0, 0, false
+	}
+
+	// Longitude (E/W → map_x)
+	xCoords := float64(degX) + float64(minX)/60.0 + float64(secX)/3600.0
+	if dirX == "W" {
+		xCoords = -xCoords
+	}
+	mx := (xCoords + 21.0) / coordCoef
+
+	// Latitude (N/S → map_z)
+	zCoords := float64(degZ) + float64(minZ)/60.0 + float64(secZ)/3600.0
+	if dirZ == "S" {
+		zCoords = -zCoords
+	}
+	mz := (zCoords + 28.0) / coordCoef
+
+	return float32(mx), float32(mz), true
+}
+
+// GetPlayerSextant returns the player's current sextant position if calibrated.
+func (h *HouseESPManager) GetPlayerSextant(playerX, playerZ float32) (string, bool) {
+	if !h.calReady {
+		return "", false
+	}
+	mx, mz := h.worldToMapCoords(playerX, playerZ)
+	return mapToSextant(float64(mx), float64(mz)), true
+}
+
 // sendCS222 sends a CS 222 packet to query house tax/protection info
 func (h *HouseESPManager) sendCS222(tlId uint32) error {
 	if h.caveAddr == 0 {
@@ -468,6 +685,11 @@ func (h *HouseESPManager) sendCS222(tlId uint32) error {
 func (h *HouseESPManager) backgroundSendAndCollect(toSend []HouseRenderInfo) {
 	defer func() { h.sending = false }()
 
+	// Recalibrate before each batch (offset can change between ESP restarts)
+	if err := h.calibrateOnce(); err != nil {
+		fmt.Printf("[HOUSES] WARNING: recalibration failed: %v\n", err)
+	}
+
 	const maxRetries = 3
 	received := 0
 	for _, house := range toSend {
@@ -505,47 +727,55 @@ func (h *HouseESPManager) backgroundSendAndCollect(toSend []HouseRenderInfo) {
 			baseTax := binary.LittleEndian.Uint32(raw[28:32])
 			protTs := binary.LittleEndian.Uint32(raw[32:36])
 
+			// +0x28 = isProtected (1=protected, 0=not), +0x29 = isDemolition (1=demolition, 0=not)
+			isDemolition := raw[0x29] == 0x01
+
 			// Store with SENT TlId (not response TlId — they differ)
+			rawCopy := make([]byte, len(raw))
+			copy(rawCopy, raw)
+
 			h.taxMutex.Lock()
 			h.taxInfo[house.TlId] = taxData{
-				Protected: int64(protTs),
-				Deposit:   deposit,
-				BaseTax:   baseTax,
-				PosX:      house.PosX,
-				PosY:      house.PosY,
-				PosZ:      house.PosZ,
-				ObjId:     house.ObjId,
-				Owner:     house.Owner,
+				Protected:   int64(protTs),
+				Deposit:     deposit,
+				BaseTax:     baseTax,
+				PosX:        house.PosX,
+				PosY:        house.PosY,
+				PosZ:        house.PosZ,
+				ObjId:       house.ObjId,
+				Owner:       house.Owner,
+				RawResponse: rawCopy,
+				Demolition:  isDemolition,
 			}
 			h.taxMutex.Unlock()
 
 			received++
 			gotResponse = true
-			fmt.Printf("[HOUSES] Response for TlId=%d: deposit=%d tax=%d protectedTs=%d",
-				house.TlId, deposit, baseTax, protTs)
-			if protTs > 0 {
-				protTime := time.Unix(int64(protTs), 0)
-				remaining := time.Until(protTime)
+
+			if isDemolition {
+				tsTime := time.Unix(int64(protTs), 0)
+				remaining := time.Until(tsTime)
 				days := int(remaining.Hours() / 24)
 				hours := int(remaining.Hours()) % 24
-				fmt.Printf(" (until %s = %dd%dh)", protTime.Format("2006-01-02"), days, hours)
-			}
-			fmt.Println()
-
-			// Alert: beep if < 3 days of protection remaining
-			if protTs > 0 {
-				remaining := time.Until(time.Unix(int64(protTs), 0))
-				if remaining <= 0 {
-					fmt.Printf("[HOUSES] ALERT: TlId=%d owner=%q protection EXPIRED!\n", house.TlId, house.Owner)
-					procBeep.Call(1000, 300)
-					time.Sleep(100 * time.Millisecond)
-					procBeep.Call(1000, 300)
-				} else if remaining < 72*time.Hour {
+				fmt.Printf("[HOUSES] DEMOLITION TlId=%d owner=%q deposit=%d tax=%d demolitionAt=%s (%dd%dh)\n",
+					house.TlId, house.Owner, deposit, baseTax, tsTime.Format("2006-01-02 15:04"), days, hours)
+				// Alert: urgent siren for demolition houses
+				procBeep.Call(1500, 200)
+				time.Sleep(80 * time.Millisecond)
+				procBeep.Call(1800, 200)
+				time.Sleep(80 * time.Millisecond)
+				procBeep.Call(2000, 200)
+			} else {
+				fmt.Printf("[HOUSES] PROTECTED TlId=%d owner=%q deposit=%d tax=%d",
+					house.TlId, house.Owner, deposit, baseTax)
+				if protTs > 0 {
+					protTime := time.Unix(int64(protTs), 0)
+					remaining := time.Until(protTime)
 					days := int(remaining.Hours() / 24)
 					hours := int(remaining.Hours()) % 24
-					fmt.Printf("[HOUSES] ALERT: TlId=%d owner=%q protection expires in %dd%dh!\n", house.TlId, house.Owner, days, hours)
-					procBeep.Call(800, 200)
+					fmt.Printf(" protectedUntil=%s (%dd%dh)", protTime.Format("2006-01-02"), days, hours)
 				}
+				fmt.Println()
 			}
 			break // got response, move to next house
 		}
@@ -561,8 +791,7 @@ func (h *HouseESPManager) backgroundSendAndCollect(toSend []HouseRenderInfo) {
 	}
 }
 
-// saveScannedHouses persists all taxInfo entries to houses.json,
-// merging with existing cached render data for coordinates/owner.
+// saveScannedHouses merges taxInfo into the in-memory houseDB and exports to Lua.
 func (h *HouseESPManager) saveScannedHouses() {
 	h.taxMutex.Lock()
 	taxCopy := make(map[uint32]taxData, len(h.taxInfo))
@@ -575,67 +804,142 @@ func (h *HouseESPManager) saveScannedHouses() {
 		return
 	}
 
-	// Load existing DB
-	var db HouseDB
-	data, err := os.ReadFile(h.dbFile)
-	if err == nil {
-		json.Unmarshal(data, &db)
-	}
-	db.Version = 1
-	db.Updated = time.Now().Format("2006-01-02 15:04:05")
+	h.dbMutex.Lock()
 
 	// Index existing entries by TlId
-	existingByTlId := make(map[uint32]int, len(db.Houses))
-	for i, e := range db.Houses {
+	existingByTlId := make(map[uint32]int, len(h.houseDB))
+	for i, e := range h.houseDB {
 		if e.TlId > 0 {
 			existingByTlId[e.TlId] = i
 		}
 	}
 
-	changed := false
 	for tlId, td := range taxCopy {
-		entry := HouseEntry{
-			TlId:      tlId,
-			Protected: td.Protected,
-			Deposit:   td.Deposit,
-			Tax:       td.BaseTax,
-			Scanned:   true,
-			ScanTime:  time.Now().Unix(),
-			X:         td.PosX,
-			Y:         td.PosY,
-			Z:         td.PosZ,
-			ObjId:     td.ObjId,
-			Owner:     td.Owner,
+		var rawHex string
+		if len(td.RawResponse) > 0 {
+			rawHex = hex.EncodeToString(td.RawResponse)
 		}
 
-		var entryIdx int
 		if idx, exists := existingByTlId[tlId]; exists {
-			db.Houses[idx] = entry
-			entryIdx = idx
+			// Re-scan: only update CS222 data, preserve coordinates
+			e := &h.houseDB[idx]
+			e.Protected = td.Protected
+			e.Deposit = td.Deposit
+			e.Tax = td.BaseTax
+			e.Owner = td.Owner
+			e.Demolition = td.Demolition
+			e.CS222Raw = rawHex
+			e.ScanTime = time.Now().Unix()
+			if !td.Demolition {
+				e.RecheckAt = time.Now().Unix() + 7*24*3600
+			}
 		} else {
-			db.Houses = append(db.Houses, entry)
-			entryIdx = len(db.Houses) - 1
+			// First scan: create full entry with coordinates
+			entry := HouseEntry{
+				TlId:       tlId,
+				Protected:  td.Protected,
+				Deposit:    td.Deposit,
+				Tax:        td.BaseTax,
+				Scanned:    true,
+				ScanTime:   time.Now().Unix(),
+				X:          td.PosX,
+				Y:          td.PosY,
+				Z:          td.PosZ,
+				ObjId:      td.ObjId,
+				Owner:      td.Owner,
+				Demolition: td.Demolition,
+				CS222Raw:   rawHex,
+			}
+			if !td.Demolition {
+				entry.RecheckAt = time.Now().Unix() + 7*24*3600
+			}
+			if h.calReady {
+				entry.MapX, entry.MapZ = h.worldToMapCoords(td.PosX, td.PosZ)
+				entry.Sextant = mapToSextant(float64(entry.MapX), float64(entry.MapZ))
+			}
+			h.houseDB = append(h.houseDB, entry)
 		}
-		changed = true
-
-		// Update in-memory DB for immediate green rendering
-		h.scannedByTlId[tlId] = &db.Houses[entryIdx]
 	}
 
-	if !changed {
-		return
+	// Rebuild lookup maps from the full slice
+	h.scannedByObjId = make(map[uint32]*HouseEntry, len(h.houseDB))
+	h.scannedByTlId = make(map[uint32]*HouseEntry, len(h.houseDB))
+	for i := range h.houseDB {
+		e := &h.houseDB[i]
+		if e.ObjId > 0 {
+			h.scannedByObjId[e.ObjId] = e
+		}
+		if e.TlId > 0 {
+			h.scannedByTlId[e.TlId] = e
+		}
 	}
 
-	out, err := json.MarshalIndent(db, "", "  ")
-	if err != nil {
-		fmt.Printf("[HOUSES] Failed to marshal houses.json: %v\n", err)
+	// Invalidate panel caches so they pick up new data
+	h.allHousesLastCheck = time.Time{}
+	h.recheckLastCheck = time.Time{}
+	h.demolitionLastCheck = time.Time{}
+
+	h.dbMutex.Unlock()
+
+	fmt.Printf("[HOUSES] Updated in-memory DB: %d houses\n", len(h.houseDB))
+
+	// Export to Lua for in-game addon
+	if h.luaExportPath != "" {
+		h.dbMutex.RLock()
+		houses := make([]HouseEntry, len(h.houseDB))
+		copy(houses, h.houseDB)
+		h.dbMutex.RUnlock()
+		h.exportToLua(houses)
+	}
+}
+
+// SetLuaExportPath sets the path for exporting house data as a Lua table
+// that can be read by the in-game addon via api.File:Read().
+func (h *HouseESPManager) SetLuaExportPath(path string) {
+	h.luaExportPath = path
+	fmt.Printf("[HOUSES] Lua export path set to: %s\n", path)
+}
+
+// exportToLua writes all scanned houses to a Lua table file.
+// Format: { {tl_id=N, sextant=[[...]], owner=[[...]], ...}, ... }
+func (h *HouseESPManager) exportToLua(houses []HouseEntry) {
+	var b strings.Builder
+	b.WriteString("{\n")
+
+	count := 0
+	for _, e := range houses {
+		if !e.Scanned || e.Sextant == "" {
+			continue
+		}
+
+		b.WriteString("    {\n")
+		fmt.Fprintf(&b, "        tl_id = %d,\n", e.TlId)
+		fmt.Fprintf(&b, "        sextant = [[%s]],\n", e.Sextant)
+		fmt.Fprintf(&b, "        owner = [[%s]],\n", e.Owner)
+		fmt.Fprintf(&b, "        timestamp = %d,\n", e.Protected)
+		fmt.Fprintf(&b, "        deposit = %d,\n", e.Deposit)
+		fmt.Fprintf(&b, "        tax = %d,\n", e.Tax)
+		if e.Demolition {
+			b.WriteString("        is_protected = false,\n")
+			b.WriteString("        is_demolition = true,\n")
+		} else {
+			b.WriteString("        is_protected = true,\n")
+			b.WriteString("        is_demolition = false,\n")
+		}
+		if e.CS222Raw != "" {
+			fmt.Fprintf(&b, "        cs222_raw = [[%s]],\n", e.CS222Raw)
+		}
+		b.WriteString("    },\n")
+		count++
+	}
+
+	b.WriteString("}\n")
+
+	if err := os.WriteFile(h.luaExportPath, []byte(b.String()), 0644); err != nil {
+		fmt.Printf("[HOUSES] Failed to export Lua: %v\n", err)
 		return
 	}
-	if err := os.WriteFile(h.dbFile, out, 0644); err != nil {
-		fmt.Printf("[HOUSES] Failed to write houses.json: %v\n", err)
-		return
-	}
-	fmt.Printf("[HOUSES] Saved %d houses to %s\n", len(db.Houses), h.dbFile)
+	fmt.Printf("[HOUSES] Exported %d houses to %s\n", count, h.luaExportPath)
 }
 
 // ============================================================================
@@ -857,29 +1161,31 @@ func (h *HouseESPManager) decryptDoodadCoords(doodadPtr uint32) (posX, posY, pos
 }
 
 // ============================================================================
-// houses.json loading (for cross-reference)
+// loadHouseDB loads from houses.json on startup (migration)
 // ============================================================================
 
 func (h *HouseESPManager) loadHouseDB() {
-	data, err := os.ReadFile(h.dbFile)
+	// Migration: load from houses.json if it exists (one-time import)
+	data, err := os.ReadFile("houses.json")
 	if err != nil {
-		fmt.Printf("[HOUSES] No %s found (will show all as 'To Map')\n", h.dbFile)
+		fmt.Println("[HOUSES] No houses.json found, starting with empty DB")
 		h.dbLoaded = false
 		return
 	}
 
 	var db HouseDB
 	if err := json.Unmarshal(data, &db); err != nil {
-		fmt.Printf("[HOUSES] Failed to parse %s: %v\n", h.dbFile, err)
+		fmt.Printf("[HOUSES] Failed to parse houses.json: %v\n", err)
 		h.dbLoaded = false
 		return
 	}
 
-	h.scannedByObjId = make(map[uint32]*HouseEntry)
-	h.scannedByTlId = make(map[uint32]*HouseEntry)
-
-	for i := range db.Houses {
-		entry := &db.Houses[i]
+	h.dbMutex.Lock()
+	h.houseDB = db.Houses
+	h.scannedByObjId = make(map[uint32]*HouseEntry, len(h.houseDB))
+	h.scannedByTlId = make(map[uint32]*HouseEntry, len(h.houseDB))
+	for i := range h.houseDB {
+		entry := &h.houseDB[i]
 		if entry.ObjId > 0 {
 			h.scannedByObjId[entry.ObjId] = entry
 		}
@@ -887,12 +1193,16 @@ func (h *HouseESPManager) loadHouseDB() {
 			h.scannedByTlId[entry.TlId] = entry
 		}
 	}
+	h.dbMutex.Unlock()
 
 	h.dbLoaded = true
-	fmt.Printf("[HOUSES] Loaded %d entries from %s\n", len(db.Houses), h.dbFile)
+	fmt.Printf("[HOUSES] Loaded %d entries from houses.json (migration)\n", len(h.houseDB))
 }
 
 func (h *HouseESPManager) isHouseScanned(objId, tlId uint32) (*HouseEntry, bool) {
+	h.dbMutex.RLock()
+	defer h.dbMutex.RUnlock()
+
 	if entry, ok := h.scannedByObjId[objId]; ok && entry.Scanned {
 		return entry, true
 	}
@@ -1003,20 +1313,24 @@ func (h *HouseESPManager) scanOnce() {
 		if dist > h.maxRange {
 			continue
 		}
-		// Lookup scanned status
+		// Lookup scanned status: check taxInfo first, then DB (both under their respective locks)
 		var protectedTs int64
 		scanned := false
+
 		h.taxMutex.Lock()
 		if td, ok := h.taxInfo[hi.TlId]; ok {
 			protectedTs = td.Protected
 			scanned = true
 		}
 		h.taxMutex.Unlock()
+
 		if !scanned {
+			h.dbMutex.RLock()
 			if entry, ok := h.scannedByTlId[hi.TlId]; ok && entry.Scanned {
 				protectedTs = entry.Protected
 				scanned = true
 			}
+			h.dbMutex.RUnlock()
 		}
 
 		houses = append(houses, HouseRenderInfo{
@@ -1091,6 +1405,11 @@ func (h *HouseESPManager) Start() {
 	} else {
 		h.installHandlerHook()
 		h.installTickHook()
+
+		// Calibrate world→map offset once (for saving map coords in JSON)
+		if err := h.calibrateOnce(); err != nil {
+			fmt.Printf("[HOUSES] WARNING: calibration failed: %v (MAP coords won't be saved)\n", err)
+		}
 	}
 
 	h.enabled = true
@@ -1148,7 +1467,10 @@ func (h *HouseESPManager) NextFilterType() int32 {
 }
 
 func (h *HouseESPManager) ReloadDB() {
-	h.loadHouseDB()
+	// Invalidate caches so panels refresh
+	h.allHousesLastCheck = time.Time{}
+	h.recheckLastCheck = time.Time{}
+	h.demolitionLastCheck = time.Time{}
 	h.firstScan = true
 	go h.scanOnce()
 }
@@ -1218,6 +1540,217 @@ func (h *HouseESPManager) GetHouseCount() (total, scanned int) {
 	return
 }
 
+// GetAllHouses returns all houses from in-memory DB, cached for 30s.
+// Sorted by protection time ascending (soonest expiry first).
+func (h *HouseESPManager) GetAllHouses() []HouseEntry {
+	now := time.Now()
+	if now.Sub(h.allHousesLastCheck) < 30*time.Second && h.allHousesCache != nil {
+		return h.allHousesCache
+	}
+
+	h.dbMutex.RLock()
+	houses := make([]HouseEntry, len(h.houseDB))
+	copy(houses, h.houseDB)
+	h.dbMutex.RUnlock()
+
+	// Sort by protection time (soonest first, unprotected last)
+	for i := 0; i < len(houses); i++ {
+		for j := i + 1; j < len(houses); j++ {
+			pi, pj := houses[i].Protected, houses[j].Protected
+			if pi > 0 && pj > 0 {
+				if pj < pi {
+					houses[i], houses[j] = houses[j], houses[i]
+				}
+			} else if pi == 0 && pj > 0 {
+				houses[i], houses[j] = houses[j], houses[i]
+			}
+		}
+	}
+
+	h.allHousesCache = houses
+	h.allHousesLastCheck = now
+	return houses
+}
+
+// ============================================================================
+// Recheck Panel — protected houses that need rescanning
+// ============================================================================
+
+func (h *HouseESPManager) ToggleRecheckPanel() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.showRecheckPanel = !h.showRecheckPanel
+	h.recheckScroll = 0
+	return h.showRecheckPanel
+}
+
+func (h *HouseESPManager) IsRecheckPanelVisible() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.showRecheckPanel
+}
+
+func (h *HouseESPManager) ScrollRecheck(delta int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.recheckScroll += delta
+	if h.recheckScroll < 0 {
+		h.recheckScroll = 0
+	}
+}
+
+func (h *HouseESPManager) GetRecheckScroll() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.recheckScroll
+}
+
+// GetRecheckHouses returns protected (non-demolition) houses where recheck_at <= now.
+// Sorted by recheck_at ascending (most overdue first).
+func (h *HouseESPManager) GetRecheckHouses() []HouseEntry {
+	now := time.Now()
+	if now.Sub(h.recheckLastCheck) < 30*time.Second && h.recheckCache != nil {
+		return h.recheckCache
+	}
+
+	h.dbMutex.RLock()
+	nowUnix := now.Unix()
+	var recheck []HouseEntry
+	for _, e := range h.houseDB {
+		if !e.Demolition && e.RecheckAt > 0 && e.RecheckAt <= nowUnix {
+			recheck = append(recheck, e)
+		}
+	}
+	h.dbMutex.RUnlock()
+
+	// Sort by recheck_at ascending (most overdue first)
+	for i := 0; i < len(recheck); i++ {
+		for j := i + 1; j < len(recheck); j++ {
+			if recheck[j].RecheckAt < recheck[i].RecheckAt {
+				recheck[i], recheck[j] = recheck[j], recheck[i]
+			}
+		}
+	}
+
+	h.recheckCache = recheck
+	h.recheckLastCheck = now
+	return recheck
+}
+
+// ============================================================================
+// Demolition Panel — houses in demolition, filtered by day
+// ============================================================================
+
+func (h *HouseESPManager) ToggleDemolitionPanel() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.showDemolitionPanel = !h.showDemolitionPanel
+	h.demolitionDayOffset = 0
+	h.demolitionScroll = 0
+	return h.showDemolitionPanel
+}
+
+func (h *HouseESPManager) IsDemolitionPanelVisible() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.showDemolitionPanel
+}
+
+func (h *HouseESPManager) NextDemolitionDay() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.demolitionDayOffset++
+	h.demolitionScroll = 0
+	h.demolitionLastCheck = time.Time{} // invalidate cache
+	return h.demolitionDayOffset
+}
+
+func (h *HouseESPManager) PrevDemolitionDay() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.demolitionDayOffset--
+	h.demolitionScroll = 0
+	h.demolitionLastCheck = time.Time{} // invalidate cache
+	return h.demolitionDayOffset
+}
+
+func (h *HouseESPManager) GetDemolitionDayOffset() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.demolitionDayOffset
+}
+
+func (h *HouseESPManager) ScrollDemolition(delta int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.demolitionScroll += delta
+	if h.demolitionScroll < 0 {
+		h.demolitionScroll = 0
+	}
+}
+
+func (h *HouseESPManager) GetDemolitionScroll() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.demolitionScroll
+}
+
+// GetDemolitionHouses returns demolition houses whose timestamp falls on the selected day.
+// dayOffset=0 means today, 1=tomorrow, -1=yesterday, etc.
+// Passing -999 means "all demolition houses" (no day filter).
+func (h *HouseESPManager) GetDemolitionHouses() []HouseEntry {
+	h.mu.Lock()
+	dayOffset := h.demolitionDayOffset
+	h.mu.Unlock()
+
+	now := time.Now()
+	if now.Sub(h.demolitionLastCheck) < 10*time.Second && h.demolitionCache != nil && h.demolitionCacheDay == dayOffset {
+		return h.demolitionCache
+	}
+
+	targetDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, dayOffset)
+	nextDay := targetDay.AddDate(0, 0, 1)
+
+	h.dbMutex.RLock()
+	var result []HouseEntry
+	for _, e := range h.houseDB {
+		if !e.Demolition || e.Protected == 0 {
+			continue
+		}
+		demTime := time.Unix(e.Protected, 0)
+		if demTime.After(targetDay) && demTime.Before(nextDay) {
+			result = append(result, e)
+		}
+	}
+	h.dbMutex.RUnlock()
+
+	// Sort by demolition time ascending
+	for i := 0; i < len(result); i++ {
+		for j := i + 1; j < len(result); j++ {
+			if result[j].Protected < result[i].Protected {
+				result[i], result[j] = result[j], result[i]
+			}
+		}
+	}
+
+	h.demolitionCache = result
+	h.demolitionCacheDay = dayOffset
+	h.demolitionLastCheck = now
+	return result
+}
+
+// GetAllDemolitionCount returns the total number of demolition houses in the DB.
+func (h *HouseESPManager) GetAllDemolitionCount() int {
+	houses := h.GetAllHouses()
+	count := 0
+	for _, e := range houses {
+		if e.Demolition {
+			count++
+		}
+	}
+	return count
+}
+
 // GetProtectionText returns protection status text
 func GetProtectionText(entry HouseRenderInfo) string {
 	if entry.Protected == 0 {
@@ -1234,6 +1767,50 @@ func GetProtectionText(entry HouseRenderInfo) string {
 		return fmt.Sprintf("%dd%dh", days, hours)
 	}
 	return fmt.Sprintf("%dh", hours)
+}
+
+// mapBtnEntry stores position of a MAP button for panels
+type mapBtnEntry struct {
+	x, y, w, h int32
+	sextant    string
+}
+
+// MarkOnMap converts sextant to map coordinates using the exact game formula
+// and places a map marker at slot 1.
+func (h *HouseESPManager) MarkOnMap(sextant string) {
+	mapX, mapZ, ok := sextantToMapCoords(sextant)
+	if !ok {
+		fmt.Printf("[MAP] skipped: invalid sextant %q\n", sextant)
+		return
+	}
+
+	markerMgr := h.x2game + OFF_MARKER_MGR
+	slotAddr := markerMgr + uintptr((5*1+165)*4) // slot 1
+
+	h.writeBytes(slotAddr, make([]byte, 20))
+
+	buf := make([]byte, 20)
+	buf[0] = 1
+	binary.LittleEndian.PutUint32(buf[4:8], math.Float32bits(mapX))
+	binary.LittleEndian.PutUint32(buf[8:12], math.Float32bits(mapZ))
+	wrote := h.writeBytes(slotAddr, buf)
+
+	fmt.Printf("[MAP] sextant=%s → map(%.1f,%.1f) ok=%v\n", sextant, mapX, mapZ, wrote)
+
+	// Debug: read back after 500ms to check if game overwrites the slot
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		readBuf := make([]byte, 20)
+		h.readBytes(slotAddr, readBuf)
+		flag := readBuf[0]
+		rx := math.Float32frombits(binary.LittleEndian.Uint32(readBuf[4:8]))
+		rz := math.Float32frombits(binary.LittleEndian.Uint32(readBuf[8:12]))
+		if rx != mapX || rz != mapZ {
+			fmt.Printf("[MAP] ⚠ SLOT OVERWRITTEN! wrote(%.1f,%.1f) but now(%.1f,%.1f) flag=%d\n", mapX, mapZ, rx, rz, flag)
+		} else {
+			fmt.Printf("[MAP] ✓ slot intact after 500ms (%.1f,%.1f) flag=%d\n", rx, rz, flag)
+		}
+	}()
 }
 
 // ============================================================================
@@ -1349,4 +1926,280 @@ func (m *Manager) drawHouseFilterUI() {
 	m.drawText(startX, rangeY, rangeText, COLOR_WHITE)
 	m.drawButton(m.houseRangeDecBtnX, m.houseRangeDecBtnY, m.rangeBtnSize, "-")
 	m.drawButton(m.houseRangeIncBtnX, m.houseRangeIncBtnY, m.rangeBtnSize, "+")
+}
+
+func (m *Manager) drawRecheckPanel() {
+	if m.houseManager == nil || !m.houseManager.IsRecheckPanelVisible() {
+		return
+	}
+
+	houses := m.houseManager.GetRecheckHouses()
+	if len(houses) == 0 {
+		// Show empty message
+		panelX := int32(480)
+		panelY := int32(150)
+		panelW := int32(460)
+		panelH := int32(30)
+		m.recheckPanelX = panelX
+		m.recheckPanelY = panelY
+		m.recheckPanelW = panelW
+		m.recheckPanelH = panelH
+		m.drawFilledRect(panelX, panelY, panelW, panelH, 0x00000000, 200)
+		m.drawText(panelX+5, panelY+4, "RECHECK - no houses due for recheck", COLOR_WHITE)
+		return
+	}
+
+	const maxVisible = 20
+	lineH := int32(16)
+	btnW := int32(36)
+	btnH := int32(14)
+	scrollBtnW := int32(24)
+	scrollBtnH := int32(16)
+	panelW := int32(500)
+
+	scroll := m.houseManager.GetRecheckScroll()
+	if scroll > len(houses)-maxVisible {
+		scroll = len(houses) - maxVisible
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+
+	visible := houses
+	if len(visible) > scroll {
+		visible = visible[scroll:]
+	}
+	if len(visible) > maxVisible {
+		visible = visible[:maxVisible]
+	}
+
+	panelH := lineH*int32(len(visible)+1) + 12 + scrollBtnH + 4
+	panelX := int32(480)
+	panelY := int32(150)
+
+	m.recheckPanelX = panelX
+	m.recheckPanelY = panelY
+	m.recheckPanelW = panelW
+	m.recheckPanelH = panelH
+
+	m.drawFilledRect(panelX, panelY, panelW, panelH, 0x00000000, 200)
+
+	titleX := panelX + 5
+	titleY := panelY + 4
+	m.drawText(titleX, titleY, fmt.Sprintf("RECHECK (%d) [%d-%d]", len(houses), scroll+1, scroll+len(visible)), COLOR_YELLOW)
+
+	m.recheckMapBtns = m.recheckMapBtns[:0]
+
+	now := time.Now()
+	for i, e := range visible {
+		y := titleY + lineH*int32(i+1)
+
+		owner := e.Owner
+		if len(owner) > 10 {
+			owner = owner[:10]
+		}
+
+		sext := e.Sextant
+		if len(sext) > 22 {
+			sext = sext[:22]
+		}
+		if sext == "" {
+			sext = fmt.Sprintf("%.0f,%.0f", e.X, e.Z)
+		}
+
+		// How overdue is the recheck
+		overdue := now.Sub(time.Unix(e.RecheckAt, 0))
+		overdueDays := int(overdue.Hours() / 24)
+		var overdueLabel string
+		if overdueDays > 0 {
+			overdueLabel = fmt.Sprintf("%dd overdue", overdueDays)
+		} else {
+			overdueLabel = fmt.Sprintf("%dh overdue", int(overdue.Hours()))
+		}
+
+		// Last scan info
+		scanAge := now.Sub(time.Unix(e.ScanTime, 0))
+		scanDays := int(scanAge.Hours() / 24)
+		scanLabel := fmt.Sprintf("scanned %dd ago", scanDays)
+
+		label := fmt.Sprintf("%-10s %-22s %s (%s)", owner, sext, overdueLabel, scanLabel)
+		m.drawText(titleX, y, label, COLOR_YELLOW)
+
+		if e.Sextant != "" {
+			bx := panelX + panelW - btnW - 5
+			by := y
+			m.drawFilledRect(bx, by, btnW, btnH, 0x00444444, 220)
+			m.drawText(bx+6, by, "MAP", COLOR_WHITE)
+
+			m.recheckMapBtns = append(m.recheckMapBtns, mapBtnEntry{
+				x: bx, y: by, w: btnW, h: btnH,
+				sextant: e.Sextant,
+			})
+		}
+	}
+
+	// Scroll buttons
+	scrollY := titleY + lineH*int32(len(visible)+1) + 2
+	upX := panelX + panelW/2 - scrollBtnW - 2
+	downX := panelX + panelW/2 + 2
+
+	m.drawFilledRect(upX, scrollY, scrollBtnW, scrollBtnH, 0x00444444, 220)
+	m.drawText(upX+8, scrollY, "UP", COLOR_WHITE)
+	m.recheckScrollUpBtn = [4]int32{upX, scrollY, scrollBtnW, scrollBtnH}
+
+	m.drawFilledRect(downX, scrollY, scrollBtnW, scrollBtnH, 0x00444444, 220)
+	m.drawText(downX+4, scrollY, "DN", COLOR_WHITE)
+	m.recheckScrollDownBtn = [4]int32{downX, scrollY, scrollBtnW, scrollBtnH}
+}
+
+func (m *Manager) drawDemolitionPanel() {
+	if m.houseManager == nil || !m.houseManager.IsDemolitionPanelVisible() {
+		return
+	}
+
+	dayOffset := m.houseManager.GetDemolitionDayOffset()
+	houses := m.houseManager.GetDemolitionHouses()
+	totalDemo := m.houseManager.GetAllDemolitionCount()
+
+	const maxVisible = 20
+	lineH := int32(16)
+	btnW := int32(36)
+	btnH := int32(14)
+	dayBtnW := int32(30)
+	dayBtnH := int32(16)
+	scrollBtnW := int32(24)
+	scrollBtnH := int32(16)
+	panelW := int32(500)
+
+	scroll := m.houseManager.GetDemolitionScroll()
+	if len(houses) > maxVisible && scroll > len(houses)-maxVisible {
+		scroll = len(houses) - maxVisible
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+
+	visible := houses
+	if len(visible) > scroll {
+		visible = visible[scroll:]
+	}
+	if len(visible) > maxVisible {
+		visible = visible[:maxVisible]
+	}
+
+	rows := len(visible)
+	if rows == 0 {
+		rows = 1 // for "no houses" message
+	}
+	panelH := lineH*int32(rows+1) + 12 + scrollBtnH + 4
+	panelX := m.screenW - panelW - 10
+	panelY := int32(10)
+
+	m.demolitionPanelX = panelX
+	m.demolitionPanelY = panelY
+	m.demolitionPanelW = panelW
+	m.demolitionPanelH = panelH
+
+	m.drawFilledRect(panelX, panelY, panelW, panelH, 0x00000000, 200)
+
+	titleX := panelX + 5
+	titleY := panelY + 4
+
+	// Day label
+	targetDay := time.Now().AddDate(0, 0, dayOffset)
+	var dayLabel string
+	switch dayOffset {
+	case 0:
+		dayLabel = "TODAY"
+	case 1:
+		dayLabel = "TOMORROW"
+	case -1:
+		dayLabel = "YESTERDAY"
+	default:
+		dayLabel = targetDay.Format("02/01")
+	}
+
+	title := fmt.Sprintf("DEMOLITION %s (%d) [total: %d]", dayLabel, len(houses), totalDemo)
+	m.drawText(titleX, titleY, title, COLOR_RED)
+
+	// PREV / NEXT day buttons
+	prevX := panelX + panelW - dayBtnW*2 - 12
+	nextX := panelX + panelW - dayBtnW - 5
+	m.drawFilledRect(prevX, titleY, dayBtnW, dayBtnH, 0x00444444, 220)
+	m.drawText(prevX+5, titleY, "<", COLOR_WHITE)
+	m.demolitionPrevBtn = [4]int32{prevX, titleY, dayBtnW, dayBtnH}
+
+	m.drawFilledRect(nextX, titleY, dayBtnW, dayBtnH, 0x00444444, 220)
+	m.drawText(nextX+5, titleY, ">", COLOR_WHITE)
+	m.demolitionNextBtn = [4]int32{nextX, titleY, dayBtnW, dayBtnH}
+
+	// Reset MAP buttons
+	m.demolitionMapBtns = m.demolitionMapBtns[:0]
+
+	if len(houses) == 0 {
+		y := titleY + lineH
+		m.drawText(titleX, y, fmt.Sprintf("No houses demolishing on %s", targetDay.Format("02/01/2006")), COLOR_WHITE)
+	} else {
+		now := time.Now()
+		for i, e := range visible {
+			y := titleY + lineH*int32(i+1)
+
+			owner := e.Owner
+			if len(owner) > 10 {
+				owner = owner[:10]
+			}
+
+			demTime := time.Unix(e.Protected, 0)
+			remaining := demTime.Sub(now)
+			timeStr := demTime.Format("15:04")
+
+			var remLabel string
+			var color uintptr
+			if remaining <= 0 {
+				remLabel = "FALLEN"
+				color = 0x00888888 // gray
+			} else {
+				hours := int(remaining.Hours())
+				mins := int(remaining.Minutes()) % 60
+				remLabel = fmt.Sprintf("%dh%dm", hours, mins)
+				color = COLOR_RED
+			}
+
+			sext := e.Sextant
+			if len(sext) > 22 {
+				sext = sext[:22]
+			}
+			if sext == "" {
+				sext = fmt.Sprintf("%.0f,%.0f", e.X, e.Z)
+			}
+
+			label := fmt.Sprintf("%-10s %s %-7s %-22s", owner, timeStr, remLabel, sext)
+			m.drawText(titleX, y, label, color)
+
+			if e.Sextant != "" {
+				bx := panelX + panelW - btnW - 5
+				by := y
+				m.drawFilledRect(bx, by, btnW, btnH, 0x00444444, 220)
+				m.drawText(bx+6, by, "MAP", COLOR_WHITE)
+
+				m.demolitionMapBtns = append(m.demolitionMapBtns, mapBtnEntry{
+					x: bx, y: by, w: btnW, h: btnH,
+					sextant: e.Sextant,
+				})
+			}
+		}
+	}
+
+	// Scroll buttons
+	scrollY := titleY + lineH*int32(rows+1) + 2
+	upX := panelX + panelW/2 - scrollBtnW - 2
+	downX := panelX + panelW/2 + 2
+
+	m.drawFilledRect(upX, scrollY, scrollBtnW, scrollBtnH, 0x00444444, 220)
+	m.drawText(upX+8, scrollY, "UP", COLOR_WHITE)
+	m.demolitionScrollUpBtn = [4]int32{upX, scrollY, scrollBtnW, scrollBtnH}
+
+	m.drawFilledRect(downX, scrollY, scrollBtnW, scrollBtnH, 0x00444444, 220)
+	m.drawText(downX+4, scrollY, "DN", COLOR_WHITE)
+	m.demolitionScrollDownBtn = [4]int32{downX, scrollY, scrollBtnW, scrollBtnH}
 }

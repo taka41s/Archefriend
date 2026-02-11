@@ -18,7 +18,9 @@ import (
 	"archefriend/reaction"
 	"archefriend/skill"
 	"archefriend/target"
+	"encoding/json"
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -26,6 +28,21 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+// AppSettings holds configurable paths loaded from settings.json
+type AppSettings struct {
+	LuaExportPath string `json:"lua_export_path"`
+}
+
+func loadSettings() AppSettings {
+	var s AppSettings
+	data, err := os.ReadFile("settings.json")
+	if err != nil {
+		return s
+	}
+	json.Unmarshal(data, &s)
+	return s
+}
 
 const (
 	OVERLAY_WIDTH  = 700
@@ -167,6 +184,12 @@ func NewApp() (*App, error) {
 		espMgr.Enable()
 		espMgr.ToggleAllEntities()
 		fmt.Println("[ESP] Target ESP e All Entities ESP iniciados automaticamente")
+
+		// Export house data as Lua table for in-game addon
+		settings := loadSettings()
+		if settings.LuaExportPath != "" {
+			espMgr.SetLuaExportPath(settings.LuaExportPath)
+		}
 	}
 
 	// ============================
@@ -729,6 +752,26 @@ func (app *App) pollHotkeys() {
 					status = "ON"
 				}
 				fmt.Printf("[ESP] Houses: %s\n", status)
+			}
+		},
+		0x21: func() { // PAGE UP - Toggle Recheck panel
+			if app.espManager != nil {
+				enabled := app.espManager.ToggleRecheckPanel()
+				status := "OFF"
+				if enabled {
+					status = "ON"
+				}
+				fmt.Printf("[ESP] Recheck Panel: %s\n", status)
+			}
+		},
+		0x22: func() { // PAGE DOWN - Toggle Demolition panel
+			if app.espManager != nil {
+				enabled := app.espManager.ToggleDemolitionPanel()
+				status := "OFF"
+				if enabled {
+					status = "ON"
+				}
+				fmt.Printf("[ESP] Demolition Panel: %s\n", status)
 			}
 		},
 		0xDE: func() { // ' (single quote) - Next house filter type

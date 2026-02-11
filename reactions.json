@@ -1,24 +1,8 @@
 [
   {
-    "type": 21,
-    "name": "Tripped (Strong)",
-    "onStart": "F3",
-    "onEnd": "",
-    "isDebuff": true,
-    "cooldownMs": 1000
-  },
-  {
     "type": 87,
     "name": "Hell Spear",
     "onStart": "F10",
-    "onEnd": "",
-    "isDebuff": true,
-    "cooldownMs": 1000
-  },
-  {
-    "type": 141,
-    "name": "Tripped",
-    "onStart": "ALT+1",
     "onEnd": "",
     "isDebuff": true,
     "cooldownMs": 1000
@@ -66,7 +50,7 @@
   {
     "type": 2458,
     "name": "Snare (charge)",
-    "onStart": "ALT+1 \u0026 ALT+4 \u0026 ALT+1",
+    "onStart": "ALT+4",
     "onEnd": "",
     "isDebuff": true,
     "cooldownMs": 1000

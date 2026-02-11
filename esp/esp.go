@@ -279,6 +279,26 @@ type Manager struct {
 	houseRangeDecBtnY       int32
 	houseRangeIncBtnX       int32
 	houseRangeIncBtnY       int32
+
+	// Recheck panel
+	recheckMapBtns       []mapBtnEntry
+	recheckPanelX        int32
+	recheckPanelY        int32
+	recheckPanelW        int32
+	recheckPanelH        int32
+	recheckScrollUpBtn   [4]int32
+	recheckScrollDownBtn [4]int32
+
+	// Demolition panel
+	demolitionMapBtns       []mapBtnEntry
+	demolitionPanelX        int32
+	demolitionPanelY        int32
+	demolitionPanelW        int32
+	demolitionPanelH        int32
+	demolitionPrevBtn       [4]int32
+	demolitionNextBtn       [4]int32
+	demolitionScrollUpBtn   [4]int32
+	demolitionScrollDownBtn [4]int32
 }
 
 // EntityInfo stores entity information
@@ -1057,6 +1077,16 @@ func (m *Manager) renderLoop() {
 		if m.houseManager != nil && m.houseManager.IsEnabled() && isVisible != 0 {
 			m.renderHouses(playerX, playerY, playerZ)
 			m.drawHouseFilterUI()
+			m.drawRecheckPanel()
+			m.drawDemolitionPanel()
+
+			// Sextant display (top-center)
+			if sext, ok := m.houseManager.GetPlayerSextant(playerX, playerZ); ok {
+				label := fmt.Sprintf("(%.0f, %.0f) %s", playerX, playerZ, sext)
+				m.drawText(m.screenW/2-150, 30, label, COLOR_YELLOW)
+			} else {
+				m.drawText(m.screenW/2-150, 30, fmt.Sprintf("(%.0f, %.0f) [no cal]", playerX, playerZ), COLOR_RED)
+			}
 		}
 
 		// 3. Copy back buffer to screen at once (no flicker)
@@ -1157,6 +1187,46 @@ func (m *Manager) processMouseInput() {
 					fmt.Printf("[UI] Houses Range: %.0fm\n", r+100.0)
 				}
 			}
+
+			// Recheck panel: scroll buttons + MAP buttons
+			rup := m.recheckScrollUpBtn
+			if rup[2] > 0 && pt.X >= rup[0] && pt.X <= rup[0]+rup[2] && pt.Y >= rup[1] && pt.Y <= rup[1]+rup[3] {
+				m.houseManager.ScrollRecheck(-5)
+			}
+			rdn := m.recheckScrollDownBtn
+			if rdn[2] > 0 && pt.X >= rdn[0] && pt.X <= rdn[0]+rdn[2] && pt.Y >= rdn[1] && pt.Y <= rdn[1]+rdn[3] {
+				m.houseManager.ScrollRecheck(5)
+			}
+			for _, btn := range m.recheckMapBtns {
+				if pt.X >= btn.x && pt.X <= btn.x+btn.w && pt.Y >= btn.y && pt.Y <= btn.y+btn.h {
+					m.houseManager.MarkOnMap(btn.sextant)
+					break
+				}
+			}
+
+			// Demolition panel: prev/next day + scroll + MAP buttons
+			dp := m.demolitionPrevBtn
+			if dp[2] > 0 && pt.X >= dp[0] && pt.X <= dp[0]+dp[2] && pt.Y >= dp[1] && pt.Y <= dp[1]+dp[3] {
+				m.houseManager.PrevDemolitionDay()
+			}
+			dn2 := m.demolitionNextBtn
+			if dn2[2] > 0 && pt.X >= dn2[0] && pt.X <= dn2[0]+dn2[2] && pt.Y >= dn2[1] && pt.Y <= dn2[1]+dn2[3] {
+				m.houseManager.NextDemolitionDay()
+			}
+			dup := m.demolitionScrollUpBtn
+			if dup[2] > 0 && pt.X >= dup[0] && pt.X <= dup[0]+dup[2] && pt.Y >= dup[1] && pt.Y <= dup[1]+dup[3] {
+				m.houseManager.ScrollDemolition(-5)
+			}
+			ddn := m.demolitionScrollDownBtn
+			if ddn[2] > 0 && pt.X >= ddn[0] && pt.X <= ddn[0]+ddn[2] && pt.Y >= ddn[1] && pt.Y <= ddn[1]+ddn[3] {
+				m.houseManager.ScrollDemolition(5)
+			}
+			for _, btn := range m.demolitionMapBtns {
+				if pt.X >= btn.x && pt.X <= btn.x+btn.w && pt.Y >= btn.y && pt.Y <= btn.y+btn.h {
+					m.houseManager.MarkOnMap(btn.sextant)
+					break
+				}
+			}
 		}
 	}
 
@@ -1201,6 +1271,22 @@ func (m *Manager) isMouseOverUI(px, py int32) bool {
 		panelY := m.screenH - panelH - 10
 		if px >= panelX && px <= panelX+panelW && py >= panelY && py <= panelY+panelH {
 			return true
+		}
+
+		// Recheck panel
+		if m.recheckPanelW > 0 && m.recheckPanelH > 0 {
+			if px >= m.recheckPanelX && px <= m.recheckPanelX+m.recheckPanelW &&
+				py >= m.recheckPanelY && py <= m.recheckPanelY+m.recheckPanelH {
+				return true
+			}
+		}
+
+		// Demolition panel
+		if m.demolitionPanelW > 0 && m.demolitionPanelH > 0 {
+			if px >= m.demolitionPanelX && px <= m.demolitionPanelX+m.demolitionPanelW &&
+				py >= m.demolitionPanelY && py <= m.demolitionPanelY+m.demolitionPanelH {
+				return true
+			}
 		}
 	}
 
@@ -1475,12 +1561,33 @@ func (m *Manager) ReloadHouses() {
 	m.houseManager.ReloadDB()
 }
 
+// SetLuaExportPath configures the path for exporting house data as Lua table
+func (m *Manager) SetLuaExportPath(path string) {
+	if m.houseManager != nil {
+		m.houseManager.SetLuaExportPath(path)
+	}
+}
+
 // NextHouseFilterType cycles doodad type filter 0→1→...→30→0
 func (m *Manager) NextHouseFilterType() {
 	if m.houseManager == nil {
 		return
 	}
 	m.houseManager.NextFilterType()
+}
+
+func (m *Manager) ToggleRecheckPanel() bool {
+	if m.houseManager == nil {
+		return false
+	}
+	return m.houseManager.ToggleRecheckPanel()
+}
+
+func (m *Manager) ToggleDemolitionPanel() bool {
+	if m.houseManager == nil {
+		return false
+	}
+	return m.houseManager.ToggleDemolitionPanel()
 }
 
 // ============================================================================
