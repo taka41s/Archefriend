@@ -17,6 +17,7 @@ type ReactionConfig struct {
 	OnEnd      string `json:"onEnd"`
 	IsDebuff   bool   `json:"isDebuff"`
 	CooldownMS int    `json:"cooldownMs"`
+	Source     string `json:"source,omitempty"` // "player" (default) or "target"
 }
 
 type Reaction struct {
@@ -29,6 +30,7 @@ type Reaction struct {
 	UseString   string
 	OnEndString string
 	CooldownMS  int
+	Source      string // "player" (default) or "target"
 	lastTrigger int64
 }
 
@@ -102,18 +104,22 @@ func (m *Manager) binarySearchIndex(id uint32) int {
 }
 
 func (m *Manager) AddReaction(r *Reaction) {
+	if r.Source == "" {
+		r.Source = "player"
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Find insertion point to maintain sorted order
-	idx := m.binarySearchIndex(r.ID)
-
-	// Check if already exists at this position
-	if idx < len(m.sorted) && m.sorted[idx].ID == r.ID {
-		// Replace existing
-		m.sorted[idx] = r
-		return
+	// Check if already exists with same ID+Source
+	for i, existing := range m.sorted {
+		if existing.ID == r.ID && existing.Source == r.Source {
+			m.sorted[i] = r
+			return
+		}
 	}
+
+	// Find insertion point to maintain sorted order by ID
+	idx := m.binarySearchIndex(r.ID)
 
 	// Insert at correct position
 	m.sorted = append(m.sorted, nil)
@@ -122,12 +128,18 @@ func (m *Manager) AddReaction(r *Reaction) {
 }
 
 func (m *Manager) RemoveReaction(id uint32) {
+	m.RemoveReactionBySource(id, "")
+}
+
+func (m *Manager) RemoveReactionBySource(id uint32, source string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	idx := m.binarySearchIndex(id)
-	if idx < len(m.sorted) && m.sorted[idx].ID == id {
-		m.sorted = append(m.sorted[:idx], m.sorted[idx+1:]...)
+	for i, r := range m.sorted {
+		if r.ID == id && (source == "" || r.Source == source) {
+			m.sorted = append(m.sorted[:i], m.sorted[i+1:]...)
+			return
+		}
 	}
 }
 
@@ -202,10 +214,20 @@ func (m *Manager) isAFK() bool {
 	return m.afkChecker.IsAFK()
 }
 
+// findBySource finds a reaction matching ID and source ("player" or "target")
+func (m *Manager) findBySource(id uint32, source string) (*Reaction, bool) {
+	for _, r := range m.sorted {
+		if r.ID == id && r.Source == source {
+			return r, true
+		}
+	}
+	return nil, false
+}
+
 func (m *Manager) OnBuffGained(buffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
-	reaction, exists := m.binarySearch(buffID)
+	reaction, exists := m.findBySource(buffID, "player")
 	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
@@ -235,7 +257,7 @@ func (m *Manager) OnBuffGained(buffID uint32) {
 func (m *Manager) OnBuffLost(buffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
-	reaction, exists := m.binarySearch(buffID)
+	reaction, exists := m.findBySource(buffID, "player")
 	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
@@ -278,13 +300,13 @@ func ToggleDebugReaction() bool {
 func (m *Manager) OnDebuffGained(debuffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
-	reaction, exists := m.binarySearch(debuffID)
+	reaction, exists := m.findBySource(debuffID, "player")
 	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
 	if DebugReaction {
 		if !exists {
-			fmt.Printf("[REACT-DBG] debuffID=%d NOT FOUND in reactions map\n", debuffID)
+			fmt.Printf("[REACT-DBG] debuffID=%d NOT FOUND in player reactions\n", debuffID)
 		} else {
 			fmt.Printf("[REACT-DBG] debuffID=%d FOUND: name=%s enabled=%v isDebuff=%v hasOnGain=%v\n",
 				debuffID, reaction.Name, reaction.Enabled, reaction.IsDebuff, len(reaction.OnGain) > 0)
@@ -327,7 +349,7 @@ func (m *Manager) OnDebuffGained(debuffID uint32) {
 func (m *Manager) OnDebuffLost(debuffID uint32) {
 	m.mu.RLock()
 	enabled := m.enabled
-	reaction, exists := m.binarySearch(debuffID)
+	reaction, exists := m.findBySource(debuffID, "player")
 	afkChecker := m.afkChecker
 	m.mu.RUnlock()
 
@@ -350,6 +372,110 @@ func (m *Manager) OnDebuffLost(debuffID uint32) {
 			fmt.Printf("[REACTION] ERROR sending keys for %s: %v\n", reaction.Name, err)
 		} else {
 			fmt.Printf("[REACTION] DONE sending keys for %s\n", reaction.Name)
+		}
+	}()
+}
+
+// ============================================================================
+// Target buff/debuff reactions
+// ============================================================================
+
+func (m *Manager) OnTargetBuffGained(buffID uint32) {
+	m.mu.RLock()
+	enabled := m.enabled
+	reaction, exists := m.findBySource(buffID, "target")
+	afkChecker := m.afkChecker
+	m.mu.RUnlock()
+
+	if !enabled || !exists || !reaction.Enabled || reaction.IsDebuff {
+		return
+	}
+	if afkChecker != nil && afkChecker.IsEnabled() && afkChecker.IsAFK() {
+		return
+	}
+	if len(reaction.OnGain) == 0 {
+		return
+	}
+
+	fmt.Printf("[REACTION] TARGET BUFF %s (ID:%d) -> Sending: %s (5x spam)\n", reaction.Name, buffID, reaction.UseString)
+	go func() {
+		if err := input.SendKeySequenceSpam(reaction.OnGain, 5); err != nil {
+			fmt.Printf("[REACTION] ERROR sending keys for %s: %v\n", reaction.Name, err)
+		}
+	}()
+}
+
+func (m *Manager) OnTargetBuffLost(buffID uint32) {
+	m.mu.RLock()
+	enabled := m.enabled
+	reaction, exists := m.findBySource(buffID, "target")
+	afkChecker := m.afkChecker
+	m.mu.RUnlock()
+
+	if !enabled || !exists || !reaction.Enabled || reaction.IsDebuff {
+		return
+	}
+	if afkChecker != nil && afkChecker.IsEnabled() && afkChecker.IsAFK() {
+		return
+	}
+	if len(reaction.OnLost) == 0 {
+		return
+	}
+
+	fmt.Printf("[REACTION] TARGET BUFF LOST %s (ID:%d) -> Sending: %s (5x spam)\n", reaction.Name, buffID, reaction.OnEndString)
+	go func() {
+		if err := input.SendKeySequenceSpam(reaction.OnLost, 5); err != nil {
+			fmt.Printf("[REACTION] ERROR sending keys for %s: %v\n", reaction.Name, err)
+		}
+	}()
+}
+
+func (m *Manager) OnTargetDebuffGained(debuffID uint32) {
+	m.mu.RLock()
+	enabled := m.enabled
+	reaction, exists := m.findBySource(debuffID, "target")
+	afkChecker := m.afkChecker
+	m.mu.RUnlock()
+
+	if !enabled || !exists || !reaction.Enabled || !reaction.IsDebuff {
+		return
+	}
+	if afkChecker != nil && afkChecker.IsEnabled() && afkChecker.IsAFK() {
+		return
+	}
+	if len(reaction.OnGain) == 0 {
+		return
+	}
+
+	fmt.Printf("[REACTION] TARGET DEBUFF %s (ID:%d) -> Sending: %s (5x spam)\n", reaction.Name, debuffID, reaction.UseString)
+	go func() {
+		if err := input.SendKeySequenceSpam(reaction.OnGain, 5); err != nil {
+			fmt.Printf("[REACTION] ERROR sending keys for %s: %v\n", reaction.Name, err)
+		}
+	}()
+}
+
+func (m *Manager) OnTargetDebuffLost(debuffID uint32) {
+	m.mu.RLock()
+	enabled := m.enabled
+	reaction, exists := m.findBySource(debuffID, "target")
+	afkChecker := m.afkChecker
+	m.mu.RUnlock()
+
+	if !enabled || !exists || !reaction.Enabled || !reaction.IsDebuff {
+		return
+	}
+	if afkChecker != nil && afkChecker.IsEnabled() && afkChecker.IsAFK() {
+		return
+	}
+	if len(reaction.OnLost) == 0 {
+		return
+	}
+
+	fmt.Printf("[REACTION] TARGET DEBUFF LOST %s (ID:%d) -> Sending: %s (5x spam)\n", reaction.Name, debuffID, reaction.OnEndString)
+	go func() {
+		if err := input.SendKeySequenceSpam(reaction.OnLost, 5); err != nil {
+			fmt.Printf("[REACTION] ERROR sending keys for %s: %v\n", reaction.Name, err)
 		}
 	}()
 }
@@ -444,6 +570,10 @@ func (m *Manager) LoadFromJSON(filename string) error {
 	}
 
 	for _, cfg := range configs {
+		source := cfg.Source
+		if source == "" {
+			source = "player"
+		}
 		reaction := &Reaction{
 			ID:          uint32(cfg.Type),
 			Name:        cfg.Name,
@@ -452,6 +582,7 @@ func (m *Manager) LoadFromJSON(filename string) error {
 			UseString:   cfg.OnStart,
 			OnEndString: cfg.OnEnd,
 			CooldownMS:  cfg.CooldownMS,
+			Source:      source,
 		}
 
 		if cfg.OnStart != "" {
@@ -484,6 +615,10 @@ func (m *Manager) SaveToJSON() error {
 	// Already sorted, no need to sort again
 	for _, r := range m.sorted {
 		if r.Enabled {
+			source := r.Source
+			if source == "" {
+				source = "player"
+			}
 			configs = append(configs, ReactionConfig{
 				Type:       int(r.ID),
 				Name:       r.Name,
@@ -491,6 +626,7 @@ func (m *Manager) SaveToJSON() error {
 				OnEnd:      r.OnEndString,
 				IsDebuff:   r.IsDebuff,
 				CooldownMS: r.CooldownMS,
+				Source:     source,
 			})
 		}
 	}
@@ -535,6 +671,9 @@ func (m *Manager) AddBuffReaction(r *Reaction) error {
 
 	r.IsDebuff = false
 	r.Enabled = true
+	if r.Source == "" {
+		r.Source = "player"
+	}
 	m.AddReaction(r)
 
 	return nil
@@ -559,6 +698,9 @@ func (m *Manager) AddDebuffReaction(r *Reaction) error {
 
 	r.IsDebuff = true
 	r.Enabled = true
+	if r.Source == "" {
+		r.Source = "player"
+	}
 	m.AddReaction(r)
 
 	return nil

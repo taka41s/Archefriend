@@ -355,17 +355,17 @@ func (aem *AllEntitiesManager) DumpFactionData(maxEntities int) []FactionDump {
 		actorModelType := aem.mainManager.readU32(uintptr(actorModel + 0x14))
 		entityVTable := aem.mainManager.readU32(uintptr(entityPtr))
 
-		isNPC := actorModelType == 0x04
+		isNPC := actorModelType != 0x00
 		isMate := false
-		isPlayer := !isNPC
 
 		vtableLowByte := (entityVTable >> 8) & 0xFF
 		if vtableLowByte == 0xDF {
 			isMate = true
-			isPlayer = false
 			isNPC = false
 		}
-		if faction == "npc" {
+
+		isPlayer := !isNPC && !isMate
+		if faction == "npc" || faction == "unknown" {
 			isPlayer = false
 			isNPC = true
 		}

@@ -196,7 +196,7 @@ func (m *BuffMonitor) Update(playerAddr uint32) {
 		timeLeft := memory.BytesToUint32(m.buffBuffer[offset+int(config.BUFF_OFF_TIME_LEFT) : offset+int(config.BUFF_OFF_TIME_LEFT)+4])
 		stack := memory.BytesToUint32(m.buffBuffer[offset+int(config.BUFF_OFF_STACK) : offset+int(config.BUFF_OFF_STACK)+4])
 
-		if buffID < 1000 || buffID > 9999999 {
+		if buffID == 0 || buffID > 9999999 {
 			continue
 		}
 
@@ -341,8 +341,8 @@ func (m *DebuffMonitor) Update(playerAddr uint32) {
 			}
 		}
 
-		// Filtro mais permissivo: durMax >= 500ms (0.5s) e <= 600000ms (10min)
-		if id < 1 || id > 50000 || durMax < 500 || durMax > 600000 {
+		// Filtro: ID valido e duracao <= 10min (durMax=0 pode ser permanente)
+		if id < 1 || id > 50000 || durMax > 600000 {
 			continue
 		}
 

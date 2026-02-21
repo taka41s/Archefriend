@@ -269,22 +269,20 @@ func (m *Manager) CollectEntitiesViaHook() []EntityInfo {
 		// Read MaxHP
 		maxHP := m.getMaxHP(entityPtr)
 
-		// Detect entity type using discovered offsets
-		// AM+0x14: 0x04 = NPC, 0x00 = Player/Mount
+		// Detect entity type
 		actorModelType := m.readU32(uintptr(actorModel + 0x14))
 		entityVTable := m.readU32(uintptr(entityPtr))
 
-		isNPC := actorModelType == 0x04
+		isNPC := actorModelType != 0x00
 		isMate := false
-		isPlayer := !isNPC
 
-		// Check for mount by VTable pattern
 		vtableLowByte := (entityVTable >> 8) & 0xFF
 		if vtableLowByte == 0xDF {
 			isMate = true
-			isPlayer = false
 			isNPC = false
 		}
+
+		isPlayer := !isNPC && !isMate
 
 		entities = append(entities, EntityInfo{
 			Address:  entityPtr,

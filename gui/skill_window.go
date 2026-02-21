@@ -20,7 +20,6 @@ const (
 	IDC_SKILL_CHECK_ENABLED   = 2005
 	IDC_SKILL_BUTTON_ADD      = 2006
 	IDC_SKILL_BUTTON_REMOVE   = 2007
-	IDC_SKILL_BUTTON_SAVE     = 2008
 	IDC_SKILL_LIST            = 2009
 	IDC_SKILL_BUTTON_EDIT     = 2010
 	IDC_SKILL_BUTTON_CLEAR    = 2011
@@ -28,6 +27,9 @@ const (
 	IDC_SKILL_CHECK_AIMBOT    = 2013
 	IDC_SKILL_CHECK_AIMONTRY  = 2014
 	IDC_SKILL_BUTTON_TEST     = 2015
+	IDC_SKILL_EDIT_SPAM       = 2016
+	IDC_SKILL_EDIT_BUFFID     = 2017
+	IDC_SKILL_CHECK_BUFFABSENT = 2018
 )
 
 type SkillConfigWindow struct {
@@ -43,12 +45,14 @@ type SkillConfigWindow struct {
 	checkEnabled    windows.Handle
 	checkAimbot     windows.Handle
 	checkAimbotOnTry windows.Handle
+	editSpam        windows.Handle
+	editBuffID      windows.Handle
+	checkBuffAbsent windows.Handle
 	listSkills      windows.Handle
 	btnAdd       windows.Handle
 	btnEdit      windows.Handle
 	btnRemove    windows.Handle
 	btnClear     windows.Handle
-	btnSave      windows.Handle
 	btnToggle    windows.Handle
 	btnTest      windows.Handle
 
@@ -111,7 +115,7 @@ func (sw *SkillConfigWindow) runWindow() {
 		uintptr(unsafe.Pointer(windowName)),
 		WS_OVERLAPPEDWINDOW,
 		150, 150, // x, y
-		700, 500, // width, height
+		700, 540, // width, height
 		0, 0,
 		hInstance,
 		0,
@@ -274,8 +278,66 @@ func (sw *SkillConfigWindow) createControls() {
 	procSetWindowText.Call(uintptr(sw.editCooldown), uintptr(unsafe.Pointer(defaultCooldown)))
 	y += 35
 
+	// Spam Count Label + Edit
+	label, _ = syscall.UTF16PtrFromString("Spam Count:")
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(label)),
+		WS_CHILD|WS_VISIBLE,
+		10, uintptr(y), 100, 20,
+		uintptr(sw.hwnd), 0, hInstance, 0,
+	)
+
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0x00000200,
+		uintptr(unsafe.Pointer(editClass)),
+		0,
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_LEFT|ES_AUTOHSCROLL,
+		120, uintptr(y), 60, 25,
+		uintptr(sw.hwnd), IDC_SKILL_EDIT_SPAM, hInstance, 0,
+	)
+	sw.editSpam = windows.Handle(hwnd)
+
+	defaultSpam, _ := syscall.UTF16PtrFromString("1")
+	procSetWindowText.Call(uintptr(sw.editSpam), uintptr(unsafe.Pointer(defaultSpam)))
+	y += 35
+
+	// Buff ID Label + Edit + Absent Checkbox
+	label, _ = syscall.UTF16PtrFromString("Buff ID:")
+	procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(staticClass)),
+		uintptr(unsafe.Pointer(label)),
+		WS_CHILD|WS_VISIBLE,
+		10, uintptr(y), 100, 20,
+		uintptr(sw.hwnd), 0, hInstance, 0,
+	)
+
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0x00000200,
+		uintptr(unsafe.Pointer(editClass)),
+		0,
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_LEFT|ES_AUTOHSCROLL,
+		120, uintptr(y), 80, 25,
+		uintptr(sw.hwnd), IDC_SKILL_EDIT_BUFFID, hInstance, 0,
+	)
+	sw.editBuffID = windows.Handle(hwnd)
+
+	checkText, _ := syscall.UTF16PtrFromString("Absent")
+	hwnd, _, _ = procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(buttonClass)),
+		uintptr(unsafe.Pointer(checkText)),
+		WS_CHILD|WS_VISIBLE|WS_TABSTOP|0x00000003, // BS_AUTOCHECKBOX
+		210, uintptr(y), 80, 25,
+		uintptr(sw.hwnd), IDC_SKILL_CHECK_BUFFABSENT, hInstance, 0,
+	)
+	sw.checkBuffAbsent = windows.Handle(hwnd)
+	y += 35
+
 	// Enabled Checkbox
-	checkText, _ := syscall.UTF16PtrFromString("Enabled")
+	checkText, _ = syscall.UTF16PtrFromString("Enabled")
 	hwnd, _, _ = procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(buttonClass)),
@@ -301,7 +363,7 @@ func (sw *SkillConfigWindow) createControls() {
 	)
 	sw.checkAimbot = windows.Handle(hwnd)
 
-	// Aimbot on Try Checkbox (antes do cast)
+	// Aimbot on Try Checkbox (before cast)
 	checkText, _ = syscall.UTF16PtrFromString("On Try")
 	hwnd, _, _ = procCreateWindowExW.Call(
 		0,
@@ -382,19 +444,6 @@ func (sw *SkillConfigWindow) createControls() {
 		uintptr(sw.hwnd), IDC_SKILL_BUTTON_TEST, hInstance, 0,
 	)
 	sw.btnTest = windows.Handle(hwnd)
-	y += 40
-
-	// Save button
-	btnText, _ = syscall.UTF16PtrFromString("Save All")
-	hwnd, _, _ = procCreateWindowExW.Call(
-		0,
-		uintptr(unsafe.Pointer(buttonClass)),
-		uintptr(unsafe.Pointer(btnText)),
-		WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,
-		10, uintptr(y), 310, 35,
-		uintptr(sw.hwnd), IDC_SKILL_BUTTON_SAVE, hInstance, 0,
-	)
-	sw.btnSave = windows.Handle(hwnd)
 
 	// List of skill reactions (right side)
 	label, _ = syscall.UTF16PtrFromString("=== SKILL REACTIONS ===")
@@ -412,7 +461,7 @@ func (sw *SkillConfigWindow) createControls() {
 		uintptr(unsafe.Pointer(listboxClass)),
 		0,
 		WS_CHILD|WS_VISIBLE|WS_TABSTOP|0x00200000|0x00100000, // LBS_NOTIFY | WS_VSCROLL
-		340, 40, 340, 380,
+		340, 40, 340, 420,
 		uintptr(sw.hwnd), IDC_SKILL_LIST, hInstance, 0,
 	)
 	sw.listSkills = windows.Handle(hwnd)
@@ -447,7 +496,21 @@ func (sw *SkillConfigWindow) refreshList() {
 			}
 		}
 
-		text := fmt.Sprintf("[%s]%s ID:%d %s -> %s", status, aimStr, r.SkillID, r.Name, r.OnCast)
+		spamStr := ""
+		if r.SpamCount > 1 {
+			spamStr = fmt.Sprintf("[x%d]", r.SpamCount)
+		}
+
+		buffStr := ""
+		if r.RequireBuffID > 0 {
+			if r.RequireBuffAbsent {
+				buffStr = fmt.Sprintf("[!B%d]", r.RequireBuffID)
+			} else {
+				buffStr = fmt.Sprintf("[B%d]", r.RequireBuffID)
+			}
+		}
+
+		text := fmt.Sprintf("[%s]%s%s%s ID:%d %s -> %s", status, aimStr, spamStr, buffStr, r.SkillID, r.Name, r.OnCast)
 		textPtr, _ := syscall.UTF16PtrFromString(text)
 
 		procSendMessage.Call(
@@ -475,8 +538,6 @@ func (sw *SkillConfigWindow) wndProc(hwnd windows.Handle, msg uint32, wParam, lP
 				sw.clearFields()
 			case IDC_SKILL_BUTTON_REMOVE:
 				sw.onRemoveReaction()
-			case IDC_SKILL_BUTTON_SAVE:
-				sw.onSaveAll()
 			case IDC_SKILL_BUTTON_TOGGLE:
 				sw.onToggleReaction()
 			case IDC_SKILL_BUTTON_TEST:
@@ -513,6 +574,8 @@ func (sw *SkillConfigWindow) onAddReaction() {
 	name := sw.getEditText(sw.editName)
 	onCast := sw.getEditText(sw.editOnCast)
 	cooldownStr := sw.getEditText(sw.editCooldown)
+	spamStr := sw.getEditText(sw.editSpam)
+	buffIDStr := sw.getEditText(sw.editBuffID)
 
 	// Parse ID
 	skillID, err := strconv.Atoi(id)
@@ -526,6 +589,15 @@ func (sw *SkillConfigWindow) onAddReaction() {
 	if err != nil {
 		cooldown = 500
 	}
+
+	// Parse spam count
+	spamCount, err := strconv.Atoi(spamStr)
+	if err != nil || spamCount < 1 {
+		spamCount = 1
+	}
+
+	// Parse buff ID
+	buffID, _ := strconv.Atoi(buffIDStr)
 
 	// Check enabled
 	enabled := false
@@ -560,18 +632,32 @@ func (sw *SkillConfigWindow) onAddReaction() {
 		aimbotOnTry = true
 	}
 
+	// Check buff absent
+	buffAbsent := false
+	ret, _, _ = procSendMessage.Call(
+		uintptr(sw.checkBuffAbsent),
+		0x00F0, // BM_GETCHECK
+		0, 0,
+	)
+	if ret == 0x0001 { // BST_CHECKED
+		buffAbsent = true
+	}
+
 	// Check if already exists
 	existing := sw.reactionManager.GetReaction(uint32(skillID))
 
 	// Create reaction
 	r := &skill.SkillReaction{
-		SkillID:     uint32(skillID),
-		Name:        name,
-		OnCast:      onCast,
-		Enabled:     enabled,
-		CooldownMS:  cooldown,
-		UseAimbot:   useAimbot,
-		AimbotOnTry: aimbotOnTry,
+		SkillID:           uint32(skillID),
+		Name:              name,
+		OnCast:            onCast,
+		Enabled:           enabled,
+		CooldownMS:        cooldown,
+		UseAimbot:         useAimbot,
+		AimbotOnTry:       aimbotOnTry,
+		SpamCount:         spamCount,
+		RequireBuffID:     uint32(buffID),
+		RequireBuffAbsent: buffAbsent,
 	}
 
 	// Add to manager
@@ -626,6 +712,12 @@ func (sw *SkillConfigWindow) onEditReaction() {
 	sw.setEditText(sw.editName, r.Name)
 	sw.setEditText(sw.editOnCast, r.OnCast)
 	sw.setEditText(sw.editCooldown, fmt.Sprintf("%d", r.CooldownMS))
+	sw.setEditText(sw.editSpam, fmt.Sprintf("%d", r.SpamCount))
+	if r.RequireBuffID > 0 {
+		sw.setEditText(sw.editBuffID, fmt.Sprintf("%d", r.RequireBuffID))
+	} else {
+		sw.setEditText(sw.editBuffID, "")
+	}
 
 	// Set enabled checkbox
 	checkValue := uintptr(0)
@@ -660,6 +752,18 @@ func (sw *SkillConfigWindow) onEditReaction() {
 		uintptr(sw.checkAimbotOnTry),
 		0x00F1, // BM_SETCHECK
 		aimbotOnTryValue,
+		0,
+	)
+
+	// Set buff absent checkbox
+	buffAbsentValue := uintptr(0)
+	if r.RequireBuffAbsent {
+		buffAbsentValue = 1
+	}
+	procSendMessage.Call(
+		uintptr(sw.checkBuffAbsent),
+		0x00F1, // BM_SETCHECK
+		buffAbsentValue,
 		0,
 	)
 }
@@ -770,17 +874,6 @@ func (sw *SkillConfigWindow) onRemoveReaction() {
 	sw.showMessage("Success", fmt.Sprintf("Removed: %s", r.Name))
 }
 
-func (sw *SkillConfigWindow) onSaveAll() {
-	err := sw.reactionManager.SaveToJSON(sw.configPath)
-	if err != nil {
-		sw.showMessage("Error", fmt.Sprintf("Failed to save: %v", err))
-		return
-	}
-
-	fmt.Println("[SKILL-CONFIG] All reactions saved to skill_reactions.json")
-	sw.showMessage("Success", "All reactions saved!")
-}
-
 func (sw *SkillConfigWindow) getEditText(hwnd windows.Handle) string {
 	length, _, _ := procGetWindowTextLength.Call(uintptr(hwnd))
 
@@ -811,6 +904,8 @@ func (sw *SkillConfigWindow) clearFields() {
 	sw.setEditText(sw.editName, "")
 	sw.setEditText(sw.editOnCast, "")
 	sw.setEditText(sw.editCooldown, "500")
+	sw.setEditText(sw.editSpam, "1")
+	sw.setEditText(sw.editBuffID, "")
 
 	// Check enabled by default
 	procSendMessage.Call(
@@ -831,6 +926,14 @@ func (sw *SkillConfigWindow) clearFields() {
 	// Uncheck aimbot on try by default
 	procSendMessage.Call(
 		uintptr(sw.checkAimbotOnTry),
+		0x00F1, // BM_SETCHECK
+		0,      // BST_UNCHECKED
+		0,
+	)
+
+	// Uncheck buff absent by default
+	procSendMessage.Call(
+		uintptr(sw.checkBuffAbsent),
 		0x00F1, // BM_SETCHECK
 		0,      // BST_UNCHECKED
 		0,

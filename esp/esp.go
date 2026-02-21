@@ -235,6 +235,7 @@ type Manager struct {
 	// House ESP (separate module)
 	houseManager *HouseESPManager
 
+
 	// Mutex for WorldToScreen (prevents race condition between ESP and Aimbot)
 	wtsMutex sync.Mutex
 
@@ -505,6 +506,15 @@ func (m *Manager) DumpFactionData() {
 	if err != nil {
 		fmt.Printf("[FACTION] Error saving JSON: %v\n", err)
 	}
+}
+
+// DebugEntityFaction scans entity memory to find per-entity FactionID offset
+func (m *Manager) DebugEntityFaction() {
+	if m.allEntitiesManager == nil {
+		fmt.Println("[FACTION_DEBUG] AllEntitiesManager not available")
+		return
+	}
+	m.allEntitiesManager.DebugEntityFaction()
 }
 
 // Close libera recursos
@@ -984,14 +994,14 @@ func (m *Manager) renderLoop() {
 			renderedCount := 0
 			skippedOffscreen := 0
 			for _, entity := range entities {
-				// Apply entity type filters
-				if entity.IsPlayer && !showPlayers {
-					continue
-				}
+				// Apply entity type filters (NPC first, then faction)
 				if entity.IsNPC && !showNPCs {
 					continue
 				}
 				if entity.IsMate && !showMates {
+					continue
+				}
+				if entity.IsPlayer && !showPlayers {
 					continue
 				}
 
@@ -2345,238 +2355,17 @@ func (m *Manager) GetAllEntitiesCached() []EntityInfo {
 	return m.allEntitiesManager.GetCachedEntities()
 }
 
-// CompareAllPlayers compares memory of all players in entity list to find common values
-func (m *Manager) CompareAllPlayers() {
+// FindEntityByID searches the cached entity list for an entity with the given ID
+// and returns its Address (entity pointer). Returns 0 if not found.
+func (m *Manager) FindEntityByID(entityID uint32) uint32 {
+	if m.allEntitiesManager == nil || entityID == 0 {
+		return 0
+	}
 	entities := m.allEntitiesManager.GetCachedEntities()
-
-	// Target names to find (case insensitive)
-	// East: naze, gaze, bugz, trickzera
-	// West: trouble
-	targetNames := map[string]bool{
-		"naze":      true,
-		"gaze":      true,
-		"bugz":      true,
-		"trickzera": true, // East
-		"trouble":   true, // West
-	}
-
-	// Show all entities found for debugging
-	fmt.Printf("[COMPARE] Total entities: %d\n", len(entities))
-	for i, e := range entities {
-		typeStr := "NPC"
-		if e.IsPlayer {
-			typeStr = "PLR"
-		}
-		fmt.Printf("  [%d] %s: %s (%.0fm)\n", i, typeStr, e.Name, e.Distance)
-	}
-
-	// Filter by target names
-	var players []EntityInfo
 	for _, e := range entities {
-		nameLower := strings.ToLower(e.Name)
-		if targetNames[nameLower] {
-			players = append(players, e)
+		if e.EntityID == entityID {
+			return e.Address
 		}
 	}
-
-	if len(players) < 2 {
-		fmt.Printf("[COMPARE] Need at least 2 target players, found %d\n", len(players))
-		return
-	}
-
-	fmt.Printf("[COMPARE] Comparing %d players:\n", len(players))
-	for _, p := range players {
-		fmt.Printf("  - %s @ 0x%08X (%.0fm)\n", p.Name, p.Address, p.Distance)
-	}
-
-	// Create output file
-	filename := fmt.Sprintf("player_compare_%s.txt", time.Now().Format("15-04-05"))
-	file, err := os.Create(filename)
-	if err != nil {
-		fmt.Printf("[COMPARE] Error: %v\n", err)
-		return
-	}
-	defer file.Close()
-
-	file.WriteString("===========================================\n")
-	file.WriteString("   PLAYER COMPARISON REPORT\n")
-	file.WriteString(fmt.Sprintf("   %s\n", time.Now().Format("2006-01-02 15:04:05")))
-	file.WriteString("===========================================\n\n")
-
-	// Expected factions
-	eastPlayers := map[string]bool{"naze": true, "gaze": true, "bugz": true, "trickzera": true}
-
-	file.WriteString("Players:\n")
-	for _, p := range players {
-		faction := "WEST"
-		if eastPlayers[strings.ToLower(p.Name)] {
-			faction = "EAST"
-		}
-		file.WriteString(fmt.Sprintf("  - %s @ 0x%08X [%s]\n", p.Name, p.Address, faction))
-	}
-
-	// Compare first 0x500 bytes of each player
-	compareSize := uint32(0x500)
-
-	// Find IDENTICAL values across all players
-	file.WriteString("\n===========================================\n")
-	file.WriteString("   IDENTICAL VALUES (potential faction/ally)\n")
-	file.WriteString("===========================================\n\n")
-
-	identicalCount := 0
-	for off := uint32(0); off < compareSize; off += 4 {
-		firstVal := m.readU32(uintptr(players[0].Address + off))
-
-		// Skip zero, pointers, large values
-		if firstVal == 0 || isValidPtr(firstVal) || firstVal > 100000000 {
-			continue
-		}
-
-		allSame := true
-		for i := 1; i < len(players); i++ {
-			val := m.readU32(uintptr(players[i].Address + off))
-			if val != firstVal {
-				allSame = false
-				break
-			}
-		}
-
-		if allSame {
-			identicalCount++
-			annotation := ""
-			if off == 0x0048 {
-				annotation = " <- ENTITY_TYPE"
-			} else if off == 0x0194 {
-				annotation = " <- FACTION (known)"
-			} else if firstVal == 2 {
-				annotation = " <- value=2"
-			} else if firstVal == 3 {
-				annotation = " <- value=3 (East?)"
-			} else if firstVal < 10 {
-				annotation = " <- small enum"
-			}
-			file.WriteString(fmt.Sprintf("0x%04X: %d%s\n", off, firstVal, annotation))
-
-			// Print important ones to console
-			if firstVal == 3 || (off >= 0x0190 && off <= 0x01A0) {
-				fmt.Printf("  0x%04X: %d%s\n", off, firstVal, annotation)
-			}
-		}
-	}
-
-	file.WriteString(fmt.Sprintf("\nTotal identical: %d\n", identicalCount))
-
-	// Detailed analysis of faction region
-	file.WriteString("\n===========================================\n")
-	file.WriteString("   FACTION REGION (0x0180-0x01C0)\n")
-	file.WriteString("===========================================\n\n")
-
-	for off := uint32(0x0180); off < 0x01C0; off += 4 {
-		file.WriteString(fmt.Sprintf("0x%04X:", off))
-		vals := make([]uint32, len(players))
-		for i, p := range players {
-			vals[i] = m.readU32(uintptr(p.Address + off))
-			faction := "W"
-			if eastPlayers[strings.ToLower(p.Name)] {
-				faction = "E"
-			}
-			file.WriteString(fmt.Sprintf(" %s[%s]=%d", p.Name, faction, vals[i]))
-		}
-		// Check if all same
-		allSame := true
-		for i := 1; i < len(vals); i++ {
-			if vals[i] != vals[0] {
-				allSame = false
-				break
-			}
-		}
-		if allSame && vals[0] != 0 && !isValidPtr(vals[0]) {
-			file.WriteString(" [ALL SAME]")
-		}
-		file.WriteString("\n")
-	}
-
-	// EAST vs WEST comparison
-	file.WriteString("\n===========================================\n")
-	file.WriteString("   EAST vs WEST DIFFERENCES\n")
-	file.WriteString("===========================================\n\n")
-
-	var eastGroup []EntityInfo
-	var westGroup []EntityInfo
-	for _, p := range players {
-		if eastPlayers[strings.ToLower(p.Name)] {
-			eastGroup = append(eastGroup, p)
-		} else {
-			westGroup = append(westGroup, p)
-		}
-	}
-
-	file.WriteString(fmt.Sprintf("East players: %d, West players: %d\n\n", len(eastGroup), len(westGroup)))
-
-	if len(eastGroup) > 0 && len(westGroup) > 0 {
-		file.WriteString("Offsets where East and West have DIFFERENT values:\n")
-		diffCount := 0
-
-		for off := uint32(0); off < compareSize; off += 4 {
-			// Get first East player value
-			eastVal := m.readU32(uintptr(eastGroup[0].Address + off))
-
-			// Get first West player value
-			westVal := m.readU32(uintptr(westGroup[0].Address + off))
-
-			// Skip if same, or if pointers/large values
-			if eastVal == westVal || isValidPtr(eastVal) || isValidPtr(westVal) {
-				continue
-			}
-			if eastVal > 100000000 || westVal > 100000000 {
-				continue
-			}
-			if eastVal == 0 && westVal == 0 {
-				continue
-			}
-
-			// Check if all East have same value
-			allEastSame := true
-			for i := 1; i < len(eastGroup); i++ {
-				if m.readU32(uintptr(eastGroup[i].Address+off)) != eastVal {
-					allEastSame = false
-					break
-				}
-			}
-
-			// Check if all West have same value
-			allWestSame := true
-			for i := 1; i < len(westGroup); i++ {
-				if m.readU32(uintptr(westGroup[i].Address+off)) != westVal {
-					allWestSame = false
-					break
-				}
-			}
-
-			annotation := ""
-			if off == 0x0194 {
-				annotation = " <- KNOWN FACTION OFFSET"
-			} else if allEastSame && allWestSame {
-				annotation = " <- POTENTIAL FACTION/ALLY INDICATOR!"
-			}
-
-			file.WriteString(fmt.Sprintf("0x%04X: EAST=%d, WEST=%d%s\n", off, eastVal, westVal, annotation))
-			fmt.Printf("  [E/W DIFF] 0x%04X: East=%d West=%d%s\n", off, eastVal, westVal, annotation)
-			diffCount++
-
-			if diffCount >= 50 {
-				file.WriteString("... (truncated)\n")
-				break
-			}
-		}
-
-		if diffCount == 0 {
-			file.WriteString("(No differences found - need more players)\n")
-		}
-	} else {
-		file.WriteString("(Need at least 1 East and 1 West player for comparison)\n")
-		fmt.Println("[COMPARE] Need at least 1 East and 1 West player for comparison")
-	}
-
-	fmt.Printf("[COMPARE] Saved to %s\n", filename)
+	return 0
 }

@@ -1,6 +1,7 @@
 package esp
 
 import (
+	"archefriend/config"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -48,6 +49,9 @@ type AllEntitiesManager struct {
 
 	// Pause state
 	paused bool
+
+	// Player logging (only print once per player)
+	loggedPlayers map[uint32]bool
 }
 
 // NewAllEntitiesManager creates a new All Entities ESP manager
@@ -64,6 +68,7 @@ func NewAllEntitiesManager(processHandle uintptr, x2game uintptr, mainManager *M
 		showWest:      true, // Show all factions by default
 		showEast:      true,
 		showPirate:    true,
+		loggedPlayers: make(map[uint32]bool),
 		stopChan:      make(chan bool, 1),
 		pauseChan:     make(chan bool, 1),
 		resumeChan:    make(chan bool, 1),
@@ -355,6 +360,13 @@ func (aem *AllEntitiesManager) processCollectedEntities(collected map[uint32]boo
 	maxRange := aem.maxRange
 	aem.mu.Unlock()
 
+	// Read local player faction info for pirate detection
+	localFactionID := aem.mainManager.readU32(aem.x2game + config.PTR_FACTION_MANAGER + uintptr(config.OFF_FACTION_LOOKUP))
+	pirateFactionID := aem.mainManager.readU32(aem.x2game + config.PTR_PIRATE_FACTION_ID)
+
+	// Track which players are still present this frame
+	currentPlayers := make(map[uint32]bool)
+
 	// Process collected entities
 	for actorModel := range collected {
 		unitId := aem.mainManager.readU32(uintptr(actorModel + 0x0C))
@@ -428,34 +440,38 @@ func (aem *AllEntitiesManager) processCollectedEntities(collected map[uint32]boo
 		// Read MaxHP
 		maxHP := aem.mainManager.getMaxHP(entityPtr)
 
-		// Detect entity type using discovered offsets
-		// AM+0x14: 0x04 = NPC, 0x00 = Player/Mount
-		// E+0x00 (VTable): 0x39D0DF00 = Mount (different from player/npc)
+		// Detect entity type
+		// AM+0x14: primary type (0x00 = Player/Mount, non-zero = NPC)
+		// E+0x00 (VTable): mount detection
 		actorModelType := aem.mainManager.readU32(uintptr(actorModel + 0x14))
 		entityVTable := aem.mainManager.readU32(uintptr(entityPtr))
 
-		isNPC := actorModelType == 0x04
-		isMate := false // Mount detection: VTable ends differently
-		isPlayer := !isNPC
+		// NPC check: any non-zero actorModelType is NPC
+		isNPC := actorModelType != 0x00
+		isMate := false
 
-		// Check for mount by VTable pattern (lower byte differs)
-		// Player/NPC VTable: 0x39D0EA00, Mount VTable: 0x39D0DF00
+		// Mount detection by VTable pattern
 		vtableLowByte := (entityVTable >> 8) & 0xFF
 		if vtableLowByte == 0xDF {
 			isMate = true
-			isPlayer = false
 			isNPC = false
 		}
 
-		// Read race string from E+0x370 (format: "foley_<race>")
+		isPlayer := !isNPC && !isMate
+
+		// Read race/faction for non-mounts
 		race := ""
 		faction := ""
-		if isPlayer {
+		if !isMate {
 			race, faction = aem.getRaceAndFaction(entityPtr)
-			// "foley_player" means humanoid NPC, not a real player
-			if faction == "npc" {
+			// "foley_player" or unknown race = NPC
+			if faction == "npc" || faction == "unknown" {
 				isPlayer = false
 				isNPC = true
+			}
+			// If detected as NPC by AM type, clear player faction
+			if isNPC {
+				faction = ""
 			}
 		}
 
@@ -477,6 +493,39 @@ func (aem *AllEntitiesManager) processCollectedEntities(collected map[uint32]boo
 			Race:           race,
 			Faction:        faction,
 		})
+
+		// Log new players with faction info
+		if isPlayer && unitId != 0 {
+			currentPlayers[unitId] = true
+			if !aem.loggedPlayers[unitId] {
+				aem.loggedPlayers[unitId] = true
+
+				isPirate := faction == "pirate" || (localFactionID != 0 && localFactionID == pirateFactionID)
+				enemyStr := ""
+				if faction != "" {
+					// Determine local side
+					localSide := "unknown"
+					if localFactionID >= 102 && localFactionID <= 104 {
+						localSide = "west"
+					} else if localFactionID >= 109 && localFactionID <= 114 {
+						localSide = "east"
+					}
+					if localSide != "unknown" && faction != localSide {
+						enemyStr = " [ENEMY]"
+					}
+				}
+
+				fmt.Printf("[FACTION] %s | race=%s faction=%s pirate=%v dist=%.0fm%s\n",
+					name, race, faction, isPirate, distance, enemyStr)
+			}
+		}
+	}
+
+	// Clean up logged players that are no longer visible
+	for id := range aem.loggedPlayers {
+		if !currentPlayers[id] {
+			delete(aem.loggedPlayers, id)
+		}
 	}
 
 	return entities
@@ -611,4 +660,31 @@ func (aem *AllEntitiesManager) removeHook() {
 	aem.hookTrampoline = 0
 
 	fmt.Println("[ALL_ENTITIES] Hook removed")
+}
+
+// DebugEntityFaction logs faction info for all nearby players.
+// Call via NUMPAD8 (diagnostics).
+func (aem *AllEntitiesManager) DebugEntityFaction() {
+	entities := aem.GetCachedEntities()
+
+	playerCount := 0
+	for _, e := range entities {
+		if !e.IsPlayer || e.Distance > 100 {
+			continue
+		}
+		playerCount++
+
+		// Read raw faction values from entity memory
+		raceFaction := aem.mainManager.readU32(uintptr(e.Address + 0x1F88))
+		pirateStatus := aem.mainManager.readU32(uintptr(e.Address + 0x49A8))
+
+		fmt.Printf("[FACTION_DEBUG] %s | faction=%s race=%s | E+0x1F88=%d E+0x49A8=%d dist=%.0fm\n",
+			e.Name, e.Faction, e.Race, raceFaction, pirateStatus, e.Distance)
+	}
+
+	if playerCount == 0 {
+		fmt.Println("[FACTION_DEBUG] Nenhum player proximo (<100m) encontrado.")
+	} else {
+		fmt.Printf("[FACTION_DEBUG] %d players detectados.\n", playerCount)
+	}
 }

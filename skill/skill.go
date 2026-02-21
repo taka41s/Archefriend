@@ -76,6 +76,8 @@ type SkillMonitor struct {
 	OnSkillTry  func(skillID uint32) // Chamado quando tenta usar skill (antes de executar)
 
 	// Skill Try Hook
+	tryHookAddr     uintptr // Endereço original da instrução hookada
+	tryOrigBytes    []byte  // Bytes originais (8 bytes) para restauração
 	tryHookCaveAddr uintptr
 	tryHookFlagAddr uintptr
 	tryHookEDIAddr  uintptr
@@ -483,7 +485,7 @@ func (sm *SkillMonitor) InstallTryHook(offset uintptr) error {
 		return fmt.Errorf("try hook já instalado")
 	}
 
-	tryHookAddr := sm.x2gameBase + offset
+	sm.tryHookAddr = sm.x2gameBase + offset
 
 	// 1. Alocar memória para a code cave
 	caveSize := 128
@@ -508,12 +510,12 @@ func (sm *SkillMonitor) InstallTryHook(offset uintptr) error {
 	sm.tryHookESPAddr = caveAddr + 0x64
 
 	// 2. Ler bytes originais (8 bytes)
-	origBytes := make([]byte, 8)
+	sm.tryOrigBytes = make([]byte, 8)
 	var bytesRead uintptr
 	ret, _, _ := procReadProcessMemory.Call(
 		uintptr(sm.handle),
-		tryHookAddr,
-		uintptr(unsafe.Pointer(&origBytes[0])),
+		sm.tryHookAddr,
+		uintptr(unsafe.Pointer(&sm.tryOrigBytes[0])),
 		8,
 		uintptr(unsafe.Pointer(&bytesRead)),
 	)
@@ -524,11 +526,11 @@ func (sm *SkillMonitor) InstallTryHook(offset uintptr) error {
 	}
 
 	fmt.Printf("[SKILL-TRY] Bytes originais em %08X: %02X %02X %02X %02X %02X %02X %02X %02X\n",
-		tryHookAddr, origBytes[0], origBytes[1], origBytes[2], origBytes[3],
-		origBytes[4], origBytes[5], origBytes[6], origBytes[7])
+		sm.tryHookAddr, sm.tryOrigBytes[0], sm.tryOrigBytes[1], sm.tryOrigBytes[2], sm.tryOrigBytes[3],
+		sm.tryOrigBytes[4], sm.tryOrigBytes[5], sm.tryOrigBytes[6], sm.tryOrigBytes[7])
 
 	// 3. Construir shellcode
-	returnAddr := tryHookAddr + 8
+	returnAddr := sm.tryHookAddr + 8
 
 	shellcode := []byte{
 		0x60, // pushad
@@ -549,8 +551,8 @@ func (sm *SkillMonitor) InstallTryHook(offset uintptr) error {
 		0x9D, // popfd
 		0x61, // popad
 		// Instruções originais (8 bytes)
-		origBytes[0], origBytes[1], origBytes[2], origBytes[3],
-		origBytes[4], origBytes[5], origBytes[6], origBytes[7],
+		sm.tryOrigBytes[0], sm.tryOrigBytes[1], sm.tryOrigBytes[2], sm.tryOrigBytes[3],
+		sm.tryOrigBytes[4], sm.tryOrigBytes[5], sm.tryOrigBytes[6], sm.tryOrigBytes[7],
 		// jmp returnAddr
 		0xE9, 0x00, 0x00, 0x00, 0x00,
 	}
@@ -591,7 +593,7 @@ func (sm *SkillMonitor) InstallTryHook(offset uintptr) error {
 	// 6. Escrever JMP para a cave
 	jmpToCave := make([]byte, 8)
 	jmpToCave[0] = 0xE9
-	jmpOffsetToCave := int32(caveAddr) - int32(tryHookAddr) - 5
+	jmpOffsetToCave := int32(caveAddr) - int32(sm.tryHookAddr) - 5
 	jmpToCave[1] = byte(jmpOffsetToCave)
 	jmpToCave[2] = byte(jmpOffsetToCave >> 8)
 	jmpToCave[3] = byte(jmpOffsetToCave >> 16)
@@ -602,7 +604,7 @@ func (sm *SkillMonitor) InstallTryHook(offset uintptr) error {
 
 	ret, _, _ = procWriteProcessMemory.Call(
 		uintptr(sm.handle),
-		tryHookAddr,
+		sm.tryHookAddr,
 		uintptr(unsafe.Pointer(&jmpToCave[0])),
 		8,
 		uintptr(unsafe.Pointer(&bytesWritten)),
@@ -613,7 +615,7 @@ func (sm *SkillMonitor) InstallTryHook(offset uintptr) error {
 		return fmt.Errorf("falha ao escrever JMP do try hook")
 	}
 
-	fmt.Printf("[SKILL-TRY] Hook instalado em %08X -> cave em %08X\n", tryHookAddr, caveAddr)
+	fmt.Printf("[SKILL-TRY] Hook instalado em %08X -> cave em %08X\n", sm.tryHookAddr, caveAddr)
 	return nil
 }
 
@@ -691,14 +693,46 @@ func (sm *SkillMonitor) CheckSkillTry() (bool, uint32) {
 	return true, skillID
 }
 
-// Close limpa recursos
+// RemoveTryHook remove o try hook e restaura os bytes originais
+func (sm *SkillMonitor) RemoveTryHook() error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.tryHookCaveAddr == 0 {
+		return nil
+	}
+
+	// Restaurar bytes originais
+	if sm.tryHookAddr != 0 && len(sm.tryOrigBytes) == 8 {
+		var bytesWritten uintptr
+		ret, _, _ := procWriteProcessMemory.Call(
+			uintptr(sm.handle),
+			sm.tryHookAddr,
+			uintptr(unsafe.Pointer(&sm.tryOrigBytes[0])),
+			8,
+			uintptr(unsafe.Pointer(&bytesWritten)),
+		)
+		if ret == 0 {
+			return fmt.Errorf("falha ao restaurar bytes originais do try hook")
+		}
+		fmt.Printf("[SKILL-TRY] Hook removido de %08X\n", sm.tryHookAddr)
+	}
+
+	// Liberar memória da code cave
+	procVirtualFreeEx.Call(uintptr(sm.handle), sm.tryHookCaveAddr, 0, MEM_RELEASE)
+	sm.tryHookCaveAddr = 0
+	sm.tryHookAddr = 0
+
+	return nil
+}
+
+// Close limpa recursos - restaura TODOS os hooks antes de liberar memória
 func (sm *SkillMonitor) Close() {
 	sm.RemoveHook()
-	if sm.tryHookCaveAddr != 0 {
-		procVirtualFreeEx.Call(uintptr(sm.handle), sm.tryHookCaveAddr, 0, MEM_RELEASE)
-	}
+	sm.RemoveTryHook()
 	if sm.execCaveAddr != 0 {
 		procVirtualFreeEx.Call(uintptr(sm.handle), sm.execCaveAddr, 0, MEM_RELEASE)
+		sm.execCaveAddr = 0
 	}
 }
 

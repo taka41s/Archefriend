@@ -2,6 +2,7 @@ package bot
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -456,8 +457,7 @@ func (b *Bot) GetConfig() Config {
 // ====================
 
 // UpdateKillQueue atualiza a fila de mobs para matar com base nas entidades atuais.
-// Usa FIFO: primeiro a entrar na range é o primeiro a ser atacado.
-// Novos mobs vão para o final da fila.
+// Ordena por distância: o mob mais perto é sempre o primeiro da fila.
 func (b *Bot) UpdateKillQueue(entities []EntityInfo, maxRange float32, mobNames []string, partial bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -475,30 +475,35 @@ func (b *Bot) UpdateKillQueue(entities []EntityInfo, maxRange float32, mobNames 
 	}
 
 	// Remove mobs que não são mais válidos (mortos, fora de range, etc)
-	// Também remove da ordem FIFO
 	newOrder := make([]uint32, 0, len(b.killQueueOrder))
 	for _, id := range b.killQueueOrder {
 		if _, ok := currentValid[id]; ok {
 			newOrder = append(newOrder, id)
 		} else {
-			// Mob saiu da range ou morreu
 			delete(b.killQueue, id)
 		}
 	}
 	b.killQueueOrder = newOrder
 
-	// Adiciona novos mobs ao FINAL da queue (FIFO)
+	// Adiciona novos mobs à queue
 	for id, e := range currentValid {
 		if _, exists := b.killQueue[id]; !exists {
 			b.killQueue[id] = e
-			b.killQueueOrder = append(b.killQueueOrder, id) // Vai pro final
+			b.killQueueOrder = append(b.killQueueOrder, id)
 			fmt.Printf("[BOT] +Queue[%d]: %s (ID:%d HP:%d Dist:%.0fm)\n",
 				len(b.killQueueOrder), e.Name, e.EntityID, e.HP, e.Distance)
 		} else {
-			// Atualiza info do mob existente (posição na fila não muda)
+			// Atualiza info do mob existente (distância, HP, posição)
 			b.killQueue[id] = e
 		}
 	}
+
+	// Ordena a queue por distância (mais perto primeiro)
+	sort.Slice(b.killQueueOrder, func(i, j int) bool {
+		ei := b.killQueue[b.killQueueOrder[i]]
+		ej := b.killQueue[b.killQueueOrder[j]]
+		return ei.Distance < ej.Distance
+	})
 }
 
 // RemoveFromKillQueue remove um mob da fila pelo EntityID.
@@ -549,7 +554,7 @@ func (b *Bot) GetKillQueueCount() int {
 	return len(b.killQueue)
 }
 
-// GetNextTarget retorna o primeiro mob da fila FIFO (excluindo o target atual).
+// GetNextTarget retorna o mob mais perto da fila (excluindo o target atual).
 func (b *Bot) GetNextTarget() *EntityInfo {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -559,17 +564,19 @@ func (b *Bot) GetNextTarget() *EntityInfo {
 		currentTargetID = b.currentTarget.EntityID
 	}
 
-	// FIFO: retorna o primeiro da fila que não seja o target atual
+	var closest *EntityInfo
 	for _, id := range b.killQueueOrder {
 		if id == currentTargetID {
 			continue
 		}
 		if e, ok := b.killQueue[id]; ok && e.HP > 0 {
-			cpy := e
-			return &cpy
+			if closest == nil || e.Distance < closest.Distance {
+				cpy := e
+				closest = &cpy
+			}
 		}
 	}
-	return nil
+	return closest
 }
 
 // ====================
@@ -695,40 +702,35 @@ func (b *Bot) tickIdle() {
 		currentEntities[e.EntityID] = e
 	}
 
-	// Pega o próximo target da queue (FIFO - primeiro a entrar)
-	// Só seleciona mobs que existem na lista atual E tem HP > 0
+	// Pega o mob mais perto da queue que ainda existe e tem HP > 0
 	b.mu.Lock()
-	var first *EntityInfo
+	var closest *EntityInfo
+	var closestDist float32
 
 	for _, id := range b.killQueueOrder {
 		if _, ok := b.killQueue[id]; ok {
-			// Verifica se o mob ainda existe na lista de entidades atual
 			currentEntity, exists := currentEntities[id]
-			if !exists {
-				// Mob despawnou - será removido pelo UpdateKillQueue na próxima iteração
+			if !exists || currentEntity.HP == 0 {
 				continue
 			}
-			if currentEntity.HP == 0 {
-				// Mob morto - pular, UpdateKillQueue vai remover
-				continue
+			if closest == nil || currentEntity.Distance < closestDist {
+				cpy := currentEntity
+				closest = &cpy
+				closestDist = currentEntity.Distance
 			}
-			// Mob válido: existe e tem HP > 0
-			cpy := currentEntity
-			first = &cpy
-			break
 		}
 	}
 	b.mu.Unlock()
 
-	if first != nil {
+	if closest != nil {
 		b.mu.Lock()
-		b.currentTarget = first
+		b.currentTarget = closest
 		b.state = StateTargeting
 		b.mu.Unlock()
 
 		queueCount := b.GetKillQueueCount()
 		fmt.Printf("[BOT] Target: %s (ID:%d HP:%d Dist:%.0fm) [Queue: %d]\n",
-			first.Name, first.EntityID, first.HP, first.Distance, queueCount)
+			closest.Name, closest.EntityID, closest.HP, closest.Distance, queueCount)
 	}
 }
 
@@ -762,10 +764,11 @@ func (b *Bot) tickTargeting() {
 	b.mu.Lock()
 	b.stats.TargetsSet++
 	b.stats.LastTargetAt = time.Now()
-	b.state = StateCombat
 	b.mu.Unlock()
 
 	fmt.Printf("[BOT] Targeting: %s (ID:%d)\n", target.Name, target.EntityID)
+
+	b.setState(StateCombat)
 
 	if b.config.OnTargetAcquired != nil {
 		b.config.OnTargetAcquired(*target)
@@ -786,15 +789,7 @@ func (b *Bot) tickCombat() {
 		return
 	}
 
-	// Target perdido no client?
-	currentId := b.getCurrentTargetId()
-	if currentId == 0 || currentId != target.EntityID {
-		fmt.Printf("[BOT] Target lost: %s\n", target.Name)
-		b.onMobDead(*target)
-		return
-	}
-
-	// Ainda vivo na entity list?
+	// Primeiro verifica se o mob ainda está vivo na entity list
 	entities := b.provider.GetEntities()
 	alive := false
 	maxRange := b.getEffectiveRange()
@@ -813,7 +808,6 @@ func (b *Bot) tickCombat() {
 			// Validar se ainda está na range
 			if e.Distance > maxRange {
 				fmt.Printf("[BOT] Target out of range: %s (%.0fm > %.0fm)\n", target.Name, e.Distance, maxRange)
-				// Remove da kill queue também para não ser selecionado de novo
 				b.RemoveFromKillQueueOutOfRange(target.EntityID)
 				b.clearTarget()
 				return
@@ -825,6 +819,14 @@ func (b *Bot) tickCombat() {
 	if !alive {
 		fmt.Printf("[BOT] Dead: %s\n", target.Name)
 		b.onMobDead(*target)
+		return
+	}
+
+	// Mob vivo mas target perdido no client? Re-targetar o MESMO mob
+	currentId := b.getCurrentTargetId()
+	if currentId == 0 || currentId != target.EntityID {
+		fmt.Printf("[BOT] Target lost in client, re-targeting: %s (ID:%d)\n", target.Name, target.EntityID)
+		b.setState(StateTargeting)
 		return
 	}
 

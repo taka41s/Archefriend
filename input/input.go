@@ -330,10 +330,10 @@ func SendKeySequenceSpam(combos [][]uint16, repeatCount int) error {
 			}
 			// Delay entre combos
 			if i < len(combos)-1 {
-				time.Sleep(20 * time.Millisecond)
+				time.Sleep(15 * time.Millisecond)
 			}
 		}
-		// Delay entre repetições
+		// Delay entre repetições (15ms)
 		if r < repeatCount-1 {
 			time.Sleep(15 * time.Millisecond)
 		}

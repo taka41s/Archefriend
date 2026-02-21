@@ -3,7 +3,6 @@ package entity
 import (
 	"archefriend/config"
 	"archefriend/memory"
-
 	"golang.org/x/sys/windows"
 )
 
@@ -12,6 +11,8 @@ type Entity struct {
 	Address      uint32
 	EntityID     uint32
 	Name         string
+	FactionID    uint32
+	FactionSide  string
 	PosX         float32
 	PosY         float32
 	PosZ         float32
@@ -76,41 +77,6 @@ func GetMaxHP(handle windows.Handle, entityAddr uint32) uint32 {
 	return memory.ReadU32(handle, uintptr(stats)+uintptr(config.OFF_MAXHP))
 }
 
-// GetLocalPlayerMana lê a mana do player local
-func GetLocalPlayerMana(handle windows.Handle, x2game uintptr) (current, max uint32) {
-	p1 := memory.ReadU32(handle, x2game+config.PTR_MANA_BASE)
-	if p1 == 0 {
-		return 0, 0
-	}
-	p2 := memory.ReadU32(handle, uintptr(p1)+uintptr(config.OFF_MANA_PTR1))
-	if p2 == 0 {
-		return 0, 0
-	}
-	p3 := memory.ReadU32(handle, uintptr(p2)+uintptr(config.OFF_MANA_PTR2))
-	if p3 == 0 {
-		return 0, 0
-	}
-	p4 := memory.ReadU32(handle, uintptr(p3)+uintptr(config.OFF_MANA_PTR3))
-	if p4 == 0 {
-		return 0, 0
-	}
-	p5 := memory.ReadU32(handle, uintptr(p4)+uintptr(config.OFF_MANA_PTR4))
-	if p5 == 0 {
-		return 0, 0
-	}
-	p6 := memory.ReadU32(handle, uintptr(p5)+uintptr(config.OFF_MANA_PTR5))
-	if p6 == 0 {
-		return 0, 0
-	}
-	p7 := memory.ReadU32(handle, uintptr(p6)+uintptr(config.OFF_MANA_PTR6))
-	if p7 == 0 {
-		return 0, 0
-	}
-
-	current = memory.ReadU32(handle, uintptr(p7)+uintptr(config.OFF_MANA_CURRENT))
-	max = memory.ReadU32(handle, uintptr(p7)+uintptr(config.OFF_MANA_MAX))
-	return current, max
-}
 
 // GetLocalPlayer retorna todas as informações do player local
 func GetLocalPlayer(handle windows.Handle, x2game uintptr) Entity {
@@ -129,9 +95,10 @@ func GetLocalPlayer(handle windows.Handle, x2game uintptr) Entity {
 	player.PosY = memory.ReadF32(handle, uintptr(player.Address)+uintptr(config.OFF_POS_Y))
 	player.HP = memory.ReadU32(handle, uintptr(player.Address)+uintptr(config.OFF_HP_CURRENT))
 	player.MaxHP = GetMaxHP(handle, player.Address)
-	player.MP, player.MaxMP = GetLocalPlayerMana(handle, x2game)
 	player.IsDead = memory.ReadU8(handle, uintptr(player.Address)+uintptr(config.OFF_IS_DEAD)) != 0
 	player.IsTargetable = player.EntityID > 0
+	player.FactionID = GetLocalPlayerFactionID(handle, x2game)
+	player.FactionSide = GetFactionSide(handle, x2game, player.FactionID)
 
 	return player
 }
@@ -147,4 +114,56 @@ func GetBuffManagerAddr(handle windows.Handle, entityAddr uint32) uintptr {
 		return 0
 	}
 	return uintptr(buffMgr)
+}
+
+// GetTargetEntityAddr retorna o endereço da entity do target
+func GetTargetEntityAddr(handle windows.Handle, x2game uintptr) uint32 {
+	return memory.ReadU32(handle, x2game+config.PTR_ENEMY_TARGET)
+}
+
+// GetTargetBuffs retorna buffs ou debuffs do target.
+// Se debuff=false → buffs normais. Se debuff=true → debuffs.
+func GetTargetBuffs(handle windows.Handle, x2game uintptr, debuff bool) []Buff {
+	targetAddr := GetTargetEntityAddr(handle, x2game)
+	if targetAddr == 0 {
+		return nil
+	}
+
+	buffMgr := GetBuffManagerAddr(handle, targetAddr)
+	if buffMgr == 0 {
+		return nil
+	}
+
+	countOff := uintptr(config.OFF_BUFF_COUNT)
+	arrayOff := uintptr(config.OFF_BUFF_ARRAY)
+	if debuff {
+		countOff = uintptr(config.OFF_DEBUFF_COUNT)
+		arrayOff = uintptr(config.OFF_DEBUFF_ARRAY)
+	}
+
+	count := memory.ReadU32(handle, buffMgr+countOff)
+	if count == 0 || count > 100 {
+		return nil
+	}
+
+	buffs := make([]Buff, 0, count)
+	for i := uint32(0); i < count; i++ {
+		entry := buffMgr + arrayOff + uintptr(i)*uintptr(config.BUFF_SIZE)
+		id := memory.ReadU32(handle, entry+uintptr(config.BUFF_OFF_ID))
+		if id == 0 {
+			continue
+		}
+		buffs = append(buffs, Buff{
+			Index:    int(i),
+			ID:       id,
+			TimeLeft: memory.ReadU32(handle, entry+uintptr(config.BUFF_OFF_TIME_LEFT)),
+			Stack:    memory.ReadU32(handle, entry+uintptr(config.BUFF_OFF_STACK)),
+		})
+	}
+	return buffs
+}
+
+func GetLocalPlayerFactionID(handle windows.Handle, x2game uintptr) uint32 {
+	managerAddr := x2game + config.PTR_FACTION_MANAGER
+	return memory.ReadU32(handle, managerAddr+uintptr(config.OFF_FACTION_LOOKUP))
 }

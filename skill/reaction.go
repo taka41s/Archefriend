@@ -18,6 +18,14 @@ type SkillReaction struct {
 	UseAimbot    bool   `json:"useAimbot"`    // Usar aimbot antes de executar a reação
 	AimbotOnTry  bool   `json:"aimbotOnTry"`  // Executar aimbot na tentativa (antes do cast)
 
+	// Key spam
+	SpamCount      int `json:"spamCount"`      // Quantas vezes repetir (0 ou 1 = sem spam)
+	SpamIntervalMS int `json:"spamIntervalMs"` // Intervalo entre repetições em ms
+
+	// Condicional de buff
+	RequireBuffID     uint32 `json:"requireBuffId"`     // Só executa se player tiver este buff (0 = sem condição)
+	RequireBuffAbsent bool   `json:"requireBuffAbsent"` // true = executar quando NÃO tiver o buff
+
 	// Runtime
 	lastTriggered time.Time
 	parsedKeys    [][]uint16
@@ -37,8 +45,14 @@ type ReactionManager struct {
 	// Callback para executar teclas
 	ExecuteKeys func(keys [][]uint16) error
 
+	// Callback para spam de teclas (keys, repeatCount)
+	SpamKeys func(keys [][]uint16, repeatCount int) error
+
 	// Callback para aimbot
 	AimAtTarget func() bool
+
+	// Callback para checar buff no player
+	HasBuff func(buffID uint32) bool
 }
 
 // NewReactionManager cria um novo gerenciador de reações
@@ -230,6 +244,22 @@ func (rm *ReactionManager) OnSkillCast(skillID uint32) {
 		return
 	}
 
+	// Verificar condição de buff
+	if reaction.RequireBuffID > 0 && rm.HasBuff != nil {
+		hasBuff := rm.HasBuff(reaction.RequireBuffID)
+		if reaction.RequireBuffAbsent {
+			// Requer que NÃO tenha o buff
+			if hasBuff {
+				return
+			}
+		} else {
+			// Requer que TENHA o buff
+			if !hasBuff {
+				return
+			}
+		}
+	}
+
 	fmt.Printf("[SKILL-REACT] Skill %s (ID:%d) detectada! Executando: %s\n",
 		reaction.Name, skillID, reaction.OnCast)
 
@@ -238,6 +268,7 @@ func (rm *ReactionManager) OnSkillCast(skillID uint32) {
 	reaction.lastTriggered = time.Now()
 	useAimbot := reaction.UseAimbot
 	aimbotOnTry := reaction.AimbotOnTry
+	spamCount := reaction.SpamCount
 	rm.mu.Unlock()
 
 	// Executar aimbot se configurado (e não já executou no try)
@@ -248,10 +279,16 @@ func (rm *ReactionManager) OnSkillCast(skillID uint32) {
 	}
 
 	// Executar teclas via callback
-	if rm.ExecuteKeys != nil && reaction.parsedKeys != nil {
+	if reaction.parsedKeys != nil {
 		go func() {
-			if err := rm.ExecuteKeys(reaction.parsedKeys); err != nil {
-				fmt.Printf("[SKILL-REACT] Erro ao executar teclas: %v\n", err)
+			if spamCount > 1 && rm.SpamKeys != nil {
+				if err := rm.SpamKeys(reaction.parsedKeys, spamCount); err != nil {
+					fmt.Printf("[SKILL-REACT] Erro ao spam teclas: %v\n", err)
+				}
+			} else if rm.ExecuteKeys != nil {
+				if err := rm.ExecuteKeys(reaction.parsedKeys); err != nil {
+					fmt.Printf("[SKILL-REACT] Erro ao executar teclas: %v\n", err)
+				}
 			}
 		}()
 	}

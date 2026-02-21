@@ -5,11 +5,9 @@ import "time"
 const (
 	PTR_GAME_CLIENT     uintptr = 0xE9DC68
 	PTR_LOCALPLAYER     uintptr = 0xE9DC54
-	PTR_ENEMY_TARGET    uintptr = 0x19EBF4 // Entity do target (ID, posição, etc)
-	PTR_TARGET_UI       uintptr = 0x0      // UI do target (HP correto) - precisa ser encontrado
+	PTR_ENEMY_TARGET    uintptr = 0x19EBF4
 
 	OFF_PLAYER_ENTITY  uint32 = 0x10
-	OFF_GC_LOCALPLAYER uint32 = 0xFC
 
 	OFF_VTABLE    uint32 = 0x00
 	OFF_ENTITY_ID uint32 = 0x30
@@ -25,23 +23,15 @@ const (
 	OFF_TO_STATS    uint32 = 0x10
 	OFF_MAXHP       uint32 = 0x420
 
+	PTR_FACTION_MANAGER    uintptr = 0x13287A0
+	OFF_FACTION_LOOKUP     uint32  = 0xBC
+	PTR_PIRATE_FACTION_ID  uintptr = 0xE9EF18
+	PTR_FACTION_THRESHOLD  uintptr = 0xE9EF14
+
 	OFF_NAME_PTR1 uint32 = 0x0C
 	OFF_NAME_PTR2 uint32 = 0x1C
 
 	OFF_IS_DEAD    uint32 = 0x46D6
-	OFF_COMBAT_RAW uint32 = 0x458C
-
-	PTR_MANA_BASE    uintptr = 0x130D824
-	OFF_MANA_PTR1    uint32  = 0x4
-	OFF_MANA_PTR2    uint32  = 0x18
-	OFF_MANA_PTR3    uint32  = 0xB0
-	OFF_MANA_PTR4    uint32  = 0x10
-	OFF_MANA_PTR5    uint32  = 0x5C
-	OFF_MANA_PTR6    uint32  = 0x0
-	OFF_MANA_CURRENT uint32  = 0x318
-	OFF_MANA_MAX     uint32  = 0x314
-
-	OFF_TARGET_ENTITY_ID uint32 = 0x73D0 // TODO
 
 	OFF_TGT_ID      uint32 = 0x008
 	OFF_TGT_TYPE    uint32 = 0x020

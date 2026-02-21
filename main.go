@@ -9,10 +9,12 @@ import (
 	"archefriend/config"
 	"archefriend/entity"
 	"archefriend/esp"
+	"archefriend/fishing"
 	"archefriend/gui"
 	"archefriend/input"
 	"archefriend/loot"
 	"archefriend/monitor"
+
 	"archefriend/patch"
 	"archefriend/process"
 	"archefriend/reaction"
@@ -22,6 +24,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -31,7 +35,9 @@ import (
 
 // AppSettings holds configurable paths loaded from settings.json
 type AppSettings struct {
-	LuaExportPath string `json:"lua_export_path"`
+	LuaExportPath    string `json:"lua_export_path"`
+	SkillCastOffset  string `json:"skill_cast_offset"`  // Hex offset for skill cast hook (e.g. "0x1A2B3C")
+	SkillTryOffset   string `json:"skill_try_offset"`   // Hex offset for skill try hook (e.g. "0x1A2B3C")
 }
 
 func loadSettings() AppSettings {
@@ -48,6 +54,22 @@ const (
 	OVERLAY_WIDTH  = 700
 	OVERLAY_HEIGHT = 150
 )
+
+// Feature flags - override via: go build -ldflags "-X main.featureX=false"
+var (
+	featureLoot      = "true"
+	featurePatches   = "true"
+	featureReactions = "true"
+	featureBuffs     = "true"
+	featureESP       = "true"
+	featureBot       = "true"
+
+	featureKeyspam   = "true"
+)
+
+func feat(flag string) bool {
+	return flag == "true" || flag == "1"
+}
 
 type App struct {
 	handle    windows.Handle
@@ -69,8 +91,6 @@ type App struct {
 	buffInjector    *buff.Injector
 	presetManager   *buff.PresetManager
 	espManager           *esp.Manager
-	skillMonitor         *skill.SkillMonitor
-	skillReactionManager *skill.ReactionManager
 	keybinds             *config.KeybindsConfig
 	targetScanner        *esp.TargetScanner
 
@@ -78,12 +98,20 @@ type App struct {
 	botInstance  *bot.Bot
 	botConfig    *bot.FileConfig
 
+	// Fishing
+	fishingBot    *fishing.Bot
+
+	// Skill Hooks
+	skillMonitor         *skill.SkillMonitor
+	skillReactionManager *skill.ReactionManager
+	skillConfigWindow    *gui.SkillConfigWindow
+
 	window            *gui.OverlayWindow
 	configWindow      *gui.ConfigWindow
 	buffWindow        *gui.BuffWindow
-	skillConfigWindow *gui.SkillConfigWindow
 	autospamWindow    *gui.AutoSpamWindow
 	botConfigWindow   *gui.BotConfigWindow
+	fishingWindow     *gui.FishingWindow
 	visible           bool
 	keyStates    map[int]bool
 	frameCount   int
@@ -100,6 +128,8 @@ func NewApp() (*App, error) {
 		keyStates: make(map[int]bool),
 		stopChan:  make(chan struct{}),
 	}
+
+	settings := loadSettings()
 
 	kb, _ := config.LoadKeybinds("keybinds.json")
 	if kb == nil {
@@ -130,191 +160,209 @@ func NewApp() (*App, error) {
 	app.connected = true
 
 	// Aplicar patches de mount + GCD
-	app.patchManager = patch.NewManager(handle, x2game)
-	app.patchManager.ApplyAll()
+	if feat(featurePatches) {
+		app.patchManager = patch.NewManager(handle, x2game)
+		app.patchManager.ApplyAll()
+	}
 
 	// Encontrar janela do ArcheAge usando o PID
 	app.gameHwnd = findWindowByPID(pid)
 
-	app.lootBypass = loot.NewBypass(handle, x2game)
-	app.inputManager = input.NewManager()
+	// Loot/Doodad bypass
+	if feat(featureLoot) {
+		app.lootBypass = loot.NewBypass(handle, x2game)
+	}
 
-	// Configurar inputManager para enviar para a janela do ArcheAge
-	app.inputManager.SetGameWindow(app.gameHwnd)
-	// Configurar teclas padrão: V e SHIFT+F
-	app.inputManager.SetKeys([][]uint16{
-		{input.VK_V},
-		{input.VK_LSHIFT, input.VK_F},
-	})
+	// Keyspam / Input manager
+	if feat(featureKeyspam) {
+		app.inputManager = input.NewManager()
+		app.inputManager.SetGameWindow(app.gameHwnd)
+		app.inputManager.SetKeys([][]uint16{
+			{input.VK_V},
+			{input.VK_LSHIFT, input.VK_F},
+		})
+	}
 
-	app.afkMonitor = afk.NewMonitor(10)
-	app.afkMonitor.OnStateChange = func(isAFK bool) {
-		if isAFK {
-			fmt.Println("[AFK] No input detected for 10s - reactions paused")
+	// Reactions (buff/debuff monitor + reaction manager + AFK)
+	if feat(featureReactions) {
+		app.afkMonitor = afk.NewMonitor(10)
+		app.afkMonitor.OnStateChange = func(isAFK bool) {
+			if isAFK {
+				fmt.Println("[AFK] No input detected for 10s - reactions paused")
+			} else {
+				fmt.Println("[AFK] Input detected - reactions resumed")
+			}
+		}
+		app.afkMonitor.Start()
+		app.reactionManager = reaction.NewManager()
+		app.reactionManager.SetAFKChecker(app.afkMonitor)
+		app.buffMonitor = monitor.NewBuffMonitor(handle, x2game)
+		app.debuffMonitor = monitor.NewDebuffMonitor(handle, x2game)
+		app.targetMonitor = target.NewMonitor(handle, x2game)
+	}
+
+	// Buff injector
+	if feat(featureBuffs) {
+		app.buffInjector = buff.NewInjector(handle)
+		app.presetManager = buff.NewPresetManager(app.buffInjector)
+		app.buffInjector.StartFreezeLoop()
+	}
+
+	// ESP
+	if feat(featureESP) {
+		espMgr, err := esp.NewManager(uintptr(handle), pid, x2game)
+		if err != nil {
+			fmt.Printf("[WARN] Falha ao criar ESP: %v\n", err)
 		} else {
-			fmt.Println("[AFK] Input detected - reactions resumed")
-		}
-	}
-	app.afkMonitor.Start()
-	app.reactionManager = reaction.NewManager()
-	app.reactionManager.SetAFKChecker(app.afkMonitor)
-	app.buffMonitor = monitor.NewBuffMonitor(handle, x2game)
-	app.debuffMonitor = monitor.NewDebuffMonitor(handle, x2game)
-	app.targetMonitor = target.NewMonitor(handle, x2game)
-	app.buffInjector = buff.NewInjector(handle)
-	app.presetManager = buff.NewPresetManager(app.buffInjector)
-	app.buffInjector.StartFreezeLoop()
+			app.espManager = espMgr
+			app.targetScanner = espMgr.NewTargetScanner()
 
-	// Create ESP manager
-	espMgr, err := esp.NewManager(uintptr(handle), pid, x2game)
-	if err != nil {
-		fmt.Printf("[WARN] Falha ao criar ESP: %v\n", err)
-	} else {
-		app.espManager = espMgr
-		// Criar scanner de target para debug
-		app.targetScanner = espMgr.NewTargetScanner()
-
-		// Carregar configuracao do aimbot
-		if err := espMgr.LoadAimbotConfig("aimbot_config.json"); err != nil {
-			fmt.Printf("[AIMBOT] Config não encontrada, usando padrão (Mouse4, Mouse5)\n")
-			espMgr.SetAimbotKeys([]int{0x05, 0x06})
-		}
-
-		// Iniciar ambos ESPs por padrão
-		espMgr.Enable()
-		espMgr.ToggleAllEntities()
-		fmt.Println("[ESP] Target ESP e All Entities ESP iniciados automaticamente")
-
-		// Export house data as Lua table for in-game addon
-		settings := loadSettings()
-		if settings.LuaExportPath != "" {
-			espMgr.SetLuaExportPath(settings.LuaExportPath)
-		}
-	}
-
-	// ============================
-	// Bot setup
-	// ============================
-	app.initBot()
-
-	// Create Skill monitor (offset 0x569E1A para hook de skill success)
-	app.skillMonitor = skill.NewSkillMonitor(handle, x2game, 0x569E1A)
-	if err := app.skillMonitor.LoadConfig("skills.json"); err != nil {
-		fmt.Printf("[SKILL] Config não encontrada, usando padrão\n")
-	}
-
-	// Create Skill reaction manager
-	app.skillReactionManager = skill.NewReactionManager()
-	if err := app.skillReactionManager.LoadFromJSON("skill_reactions.json"); err != nil {
-		fmt.Printf("[SKILL-REACT] Config não encontrada, criando padrão\n")
-		skill.SaveDefaultReactions("skill_reactions.json")
-		app.skillReactionManager.LoadFromJSON("skill_reactions.json")
-	}
-
-	// Configurar parser e executor de teclas
-	app.skillReactionManager.SetKeyParser(input.ParseKeySequence)
-	app.skillReactionManager.ExecuteKeys = input.SendKeySequence
-
-	// Configurar aimbot callback
-	app.skillReactionManager.AimAtTarget = func() bool {
-		if app.espManager != nil {
-			return app.espManager.AimAtTarget()
-		}
-		return false
-	}
-
-	// Callback para printar skill usada E executar reações
-	app.skillMonitor.OnSkillCast = func(skillID uint32) {
-		name := app.skillMonitor.GetSkillName(skillID)
-		fmt.Printf("[SKILL] >>> %s (ID:%d) usado! <<<\n", name, skillID)
-
-		// Executar reação se configurada
-		app.skillReactionManager.OnSkillCast(skillID)
-	}
-
-	// Callback para tentativa de uso de skill (antes do cast)
-	app.skillMonitor.OnSkillTry = func(skillID uint32) {
-		name := app.skillMonitor.GetSkillName(skillID)
-		fmt.Printf("[SKILL-TRY] Tentando usar %s (ID:%d)\n", name, skillID)
-
-		// Executar aimbot se configurado para OnTry
-		app.skillReactionManager.OnSkillTry(skillID)
-	}
-
-	if err := app.presetManager.LoadFromJSON("buff_presets.json"); err != nil {
-		app.presetManager.CreateDefaultPresets()
-		app.presetManager.SaveToJSON("buff_presets.json")
-	}
-
-	app.reactionManager.LoadFromJSON("reactions.json")
-	app.buffMonitor.SetReactionHandler(app.reactionManager)
-	app.debuffMonitor.SetReactionHandler(app.reactionManager)
-
-	configWindow, err := gui.NewConfigWindow(app.reactionManager)
-	if err == nil {
-		app.configWindow = configWindow
-		// Callback to test reactions via GUI (F7) - emulates buff/debuff detection
-		app.configWindow.TestReaction = func(id uint32) {
-			// Uses TriggerForTest with key executor that sends directly to game window
-			keyExecutor := func(keys [][]uint16) error {
-				return input.SendKeySequenceToWindow(app.gameHwnd, keys)
+			if err := espMgr.LoadAimbotConfig("aimbot_config.json"); err != nil {
+				fmt.Printf("[AIMBOT] Config não encontrada, usando padrão (Mouse4, Mouse5)\n")
+				espMgr.SetAimbotKeys([]int{0x05, 0x06})
 			}
-			if err := app.reactionManager.TriggerForTest(id, keyExecutor); err != nil {
-				fmt.Printf("[REACTION-TEST] Error: %v\n", err)
+
+			espMgr.Enable()
+			espMgr.ToggleAllEntities()
+			fmt.Println("[ESP] Target ESP e All Entities ESP iniciados automaticamente")
+
+			if settings.LuaExportPath != "" {
+				espMgr.SetLuaExportPath(settings.LuaExportPath)
 			}
 		}
 	}
 
-	buffWindow, err := gui.NewBuffWindow(app.buffInjector, app.presetManager)
-	if err == nil {
-		app.buffWindow = buffWindow
+
+	// Bot (requires ESP)
+	if feat(featureBot) {
+		app.initBot()
 	}
 
-	skillConfigWindow, err := gui.NewSkillConfigWindow(app.skillReactionManager, "skill_reactions.json")
-	if err == nil {
-		app.skillConfigWindow = skillConfigWindow
-		// Callback to test reactions via GUI - sends directly to game window
-		app.skillConfigWindow.ExecuteOnCast = func(onCast string) {
-			keys, err := input.ParseKeySequence(onCast)
-			if err != nil {
-				fmt.Printf("[SKILL-TEST] Error parsing '%s': %v\n", onCast, err)
+	// Buff presets (requires featureBuffs)
+	if feat(featureBuffs) && app.presetManager != nil {
+		if err := app.presetManager.LoadFromJSON("buff_presets.json"); err != nil {
+			app.presetManager.CreateDefaultPresets()
+			app.presetManager.SaveToJSON("buff_presets.json")
+		}
+	}
+
+	// Reaction configs + callbacks (requires featureReactions)
+	if feat(featureReactions) && app.reactionManager != nil {
+		app.reactionManager.LoadFromJSON("reactions.json")
+		app.buffMonitor.SetReactionHandler(app.reactionManager)
+		app.debuffMonitor.SetReactionHandler(app.reactionManager)
+
+		configWindow, err := gui.NewConfigWindow(app.reactionManager)
+		if err == nil {
+			app.configWindow = configWindow
+			app.configWindow.TestReaction = func(id uint32) {
+				keyExecutor := func(keys [][]uint16) error {
+					return input.SendKeySequenceToWindow(app.gameHwnd, keys)
+				}
+				if err := app.reactionManager.TriggerForTest(id, keyExecutor); err != nil {
+					fmt.Printf("[REACTION-TEST] Error: %v\n", err)
+				}
+			}
+		}
+
+		app.buffMonitor.OnBuffGained = func(buff monitor.BuffInfo) {
+			app.reactionManager.OnBuffGained(buff.ID)
+		}
+		app.buffMonitor.OnBuffLost = func(buffID uint32) {
+			app.reactionManager.OnBuffLost(buffID)
+		}
+		app.debuffMonitor.OnDebuffGained = func(debuff monitor.DebuffInfo) {
+			fmt.Printf("[MAIN] Debuff detectado: TypeID:%d (instance ID:%d)\n", debuff.TypeID, debuff.ID)
+			app.reactionManager.OnDebuffGained(debuff.TypeID)
+		}
+		app.debuffMonitor.OnDebuffLost = func(debuffTypeID uint32) {
+			app.reactionManager.OnDebuffLost(debuffTypeID)
+		}
+
+		// Wire up entity resolution: target ID -> entity address via ESP entity list
+		app.targetMonitor.ResolveEntityAddr = func(entityID uint32) uint32 {
+			if app.espManager != nil {
+				return app.espManager.FindEntityByID(entityID)
+			}
+			return 0
+		}
+
+		// Target buff/debuff callbacks (via target.Monitor) - uses target-specific reaction methods
+		app.targetMonitor.OnBuffGained = func(buff target.TargetBuff) {
+			fmt.Printf("[TARGET-BUFF+] ID:%d Duration:%dms Stack:%d\n", buff.ID, buff.Duration, buff.Stack)
+			app.reactionManager.OnTargetBuffGained(buff.ID)
+			// Forward to fishing bot
+			if app.fishingBot != nil {
+				app.fishingBot.OnTargetBuffGained(buff.ID)
+			}
+		}
+		app.targetMonitor.OnBuffLost = func(buffID uint32) {
+			fmt.Printf("[TARGET-BUFF-] ID:%d\n", buffID)
+			app.reactionManager.OnTargetBuffLost(buffID)
+		}
+		app.targetMonitor.OnDebuffGained = func(debuff target.TargetBuff) {
+			fmt.Printf("[TARGET-DEBUFF+] TypeID:%d ID:%d Duration:%.1fs\n", debuff.TypeID, debuff.ID, float64(debuff.Duration)/1000)
+			app.reactionManager.OnTargetDebuffGained(debuff.TypeID)
+		}
+		app.targetMonitor.OnDebuffLost = func(debuffID uint32) {
+			fmt.Printf("[TARGET-DEBUFF-] ID:%d\n", debuffID)
+			app.reactionManager.OnTargetDebuffLost(debuffID)
+		}
+	}
+
+	// Buff window (requires featureBuffs)
+	if feat(featureBuffs) && app.buffInjector != nil {
+		buffWindow, err := gui.NewBuffWindow(app.buffInjector, app.presetManager)
+		if err == nil {
+			app.buffWindow = buffWindow
+		}
+	}
+
+
+	// Autospam window (requires featureKeyspam)
+	if feat(featureKeyspam) && app.inputManager != nil {
+		autospamWindow, err := gui.NewAutoSpamWindow(app.inputManager)
+		if err == nil {
+			app.autospamWindow = autospamWindow
+		}
+	}
+
+	// Bot config window (requires featureBot)
+	if feat(featureBot) && app.botInstance != nil {
+		botConfigWindow, err := gui.NewBotConfigWindow(app.botInstance, app.botConfig, "bot_config.json")
+		if err == nil {
+			app.botConfigWindow = botConfigWindow
+			app.botConfigWindow.OnToggleBot = func() {
+				app.toggleBot()
+			}
+		}
+	}
+
+	// Skill Hook System (requires process handle + offsets in settings.json)
+	if app.connected && settings.SkillCastOffset != "" {
+		app.initSkillSystem(settings)
+	}
+
+	// Fishing Bot (requires featureReactions for target buff monitoring)
+	if feat(featureReactions) && app.targetMonitor != nil {
+		app.fishingBot = fishing.New(func(keyStr string) {
+			if app.gameHwnd == 0 {
+				fishing.ParseAndSendKey(keyStr)
 				return
 			}
-			if err := input.SendKeySequenceToWindow(app.gameHwnd, keys); err != nil {
-				fmt.Printf("[SKILL-TEST] Error sending '%s': %v\n", onCast, err)
-			} else {
-				fmt.Printf("[SKILL-TEST] Sent to game window: %s\n", onCast)
+			if err := input.SendKeyStringToWindow(app.gameHwnd, keyStr); err != nil {
+				fmt.Printf("[FISHING] SendKey failed: %v\n", err)
 			}
+		})
+		if err := app.fishingBot.LoadConfig("fishing_config.json"); err != nil {
+			fmt.Printf("[FISHING] Config error: %v\n", err)
 		}
-	}
 
-	autospamWindow, err := gui.NewAutoSpamWindow(app.inputManager)
-	if err == nil {
-		app.autospamWindow = autospamWindow
-	}
-
-	// Bot config window
-	botConfigWindow, err := gui.NewBotConfigWindow(app.botInstance, app.botConfig, "bot_config.json")
-	if err == nil {
-		app.botConfigWindow = botConfigWindow
-		app.botConfigWindow.OnToggleBot = func() {
-			app.toggleBot()
+		fishingWindow, err := gui.NewFishingWindow(app.fishingBot, "fishing_config.json")
+		if err == nil {
+			app.fishingWindow = fishingWindow
 		}
-	}
-
-	// Setup reaction callbacks
-	app.buffMonitor.OnBuffGained = func(buff monitor.BuffInfo) {
-		app.reactionManager.OnBuffGained(buff.ID)
-	}
-	app.buffMonitor.OnBuffLost = func(buffID uint32) {
-		app.reactionManager.OnBuffLost(buffID)
-	}
-	app.debuffMonitor.OnDebuffGained = func(debuff monitor.DebuffInfo) {
-		fmt.Printf("[MAIN] Debuff detectado: TypeID:%d (instance ID:%d)\n", debuff.TypeID, debuff.ID)
-		app.reactionManager.OnDebuffGained(debuff.TypeID)
-	}
-	app.debuffMonitor.OnDebuffLost = func(debuffTypeID uint32) {
-		app.reactionManager.OnDebuffLost(debuffTypeID)
+		fmt.Println("[FISHING] Sport Fishing Bot initialized")
 	}
 
 	app.startBackgroundTasks()
@@ -510,6 +558,128 @@ func (app *App) botReloadConfig() {
 }
 
 // ============================================================================
+// Skill System
+// ============================================================================
+
+func parseHexOffset(s string) (uintptr, error) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimPrefix(s, "0X")
+	val, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		return 0, err
+	}
+	return uintptr(val), nil
+}
+
+func (app *App) initSkillSystem(settings AppSettings) {
+	castOffset, err := parseHexOffset(settings.SkillCastOffset)
+	if err != nil {
+		fmt.Printf("[SKILL] Invalid skill_cast_offset: %v\n", err)
+		return
+	}
+
+	app.skillMonitor = skill.NewSkillMonitor(app.handle, app.x2game, castOffset)
+
+	// Install main hook (skill cast detection)
+	if err := app.skillMonitor.InstallHook(); err != nil {
+		fmt.Printf("[SKILL] Falha ao instalar hook: %v\n", err)
+		app.skillMonitor = nil
+		return
+	}
+
+	// Install try hook if offset configured
+	if settings.SkillTryOffset != "" {
+		tryOffset, err := parseHexOffset(settings.SkillTryOffset)
+		if err != nil {
+			fmt.Printf("[SKILL] Invalid skill_try_offset: %v\n", err)
+		} else {
+			if err := app.skillMonitor.InstallTryHook(tryOffset); err != nil {
+				fmt.Printf("[SKILL] Falha ao instalar try hook: %v\n", err)
+			}
+		}
+	}
+
+	// Skill Reaction Manager
+	app.skillReactionManager = skill.NewReactionManager()
+	if err := app.skillReactionManager.LoadFromJSON("skill_reactions.json"); err != nil {
+		fmt.Printf("[SKILL] skill_reactions.json não encontrado, criando padrão\n")
+		skill.SaveDefaultReactions("skill_reactions.json")
+		app.skillReactionManager.LoadFromJSON("skill_reactions.json")
+	}
+
+	// Wire callbacks
+	app.skillReactionManager.ExecuteKeys = func(keys [][]uint16) error {
+		return input.SendKeySequenceToWindow(app.gameHwnd, keys)
+	}
+	app.skillReactionManager.SpamKeys = func(keys [][]uint16, repeatCount int) error {
+		for i := 0; i < repeatCount; i++ {
+			if err := input.SendKeySequenceToWindow(app.gameHwnd, keys); err != nil {
+				return err
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		return nil
+	}
+
+	// Wire aimbot if ESP available
+	if app.espManager != nil {
+		app.skillReactionManager.AimAtTarget = func() bool {
+			return app.espManager.AimAtTarget()
+		}
+	}
+
+	// Wire buff checker
+	if app.buffMonitor != nil {
+		app.skillReactionManager.HasBuff = func(buffID uint32) bool {
+			for _, b := range app.buffMonitor.Buffs {
+				if b.ID == buffID {
+					return true
+				}
+			}
+			return false
+		}
+	}
+
+	// Parse keys for existing reactions
+	app.skillReactionManager.SetKeyParser(func(s string) ([][]uint16, error) {
+		keys, err := input.ParseKeyString(s)
+		if err != nil {
+			return nil, err
+		}
+		return [][]uint16{keys}, nil
+	})
+
+	// Connect SkillMonitor callbacks to ReactionManager
+	app.skillMonitor.OnSkillCast = func(skillID uint32) {
+		app.skillReactionManager.OnSkillCast(skillID)
+	}
+	app.skillMonitor.OnSkillTry = func(skillID uint32) {
+		app.skillReactionManager.OnSkillTry(skillID)
+	}
+
+	// Skill Config Window (GUI)
+	skillConfigWindow, err := gui.NewSkillConfigWindow(app.skillReactionManager, "skill_reactions.json")
+	if err == nil {
+		app.skillConfigWindow = skillConfigWindow
+		app.skillConfigWindow.ExecuteOnCast = func(onCast string) {
+			keys, err := input.ParseKeyString(onCast)
+			if err != nil {
+				fmt.Printf("[SKILL] Invalid key: %s - %v\n", onCast, err)
+				return
+			}
+			input.SendKeySequenceToWindow(app.gameHwnd, [][]uint16{keys})
+		}
+	}
+
+	fmt.Printf("[SKILL] Sistema de skills inicializado (cast:0x%X", castOffset)
+	if settings.SkillTryOffset != "" {
+		fmt.Printf(" try:0x%s", settings.SkillTryOffset)
+	}
+	fmt.Println(")")
+}
+
+// ============================================================================
 // Background tasks
 // ============================================================================
 
@@ -583,21 +753,25 @@ func (app *App) monitorLoop() {
 					return
 				}
 
-				app.buffMonitor.Update(playerAddr)
-				app.debuffMonitor.Update(playerAddr)
-
-				// Update skill monitor
-				if app.skillMonitor != nil && app.skillMonitor.Enabled {
-					app.skillMonitor.Update()
+				if app.buffMonitor != nil {
+					app.buffMonitor.Update(playerAddr)
+				}
+				if app.debuffMonitor != nil {
+					app.debuffMonitor.Update(playerAddr)
 				}
 
-				// Update target monitor
+				// Update target monitor (reads target buffs/debuffs)
 				if app.targetMonitor != nil {
 					player := entity.GetLocalPlayer(app.handle, app.x2game)
 					app.targetMonitor.Update(player.PosX, player.PosY, player.PosZ)
 				}
 
-				if app.buffInjector != nil {
+				// Update skill monitor (checks code cave flags)
+				if app.skillMonitor != nil {
+					app.skillMonitor.Update()
+				}
+
+				if app.buffInjector != nil && app.buffMonitor != nil {
 					buffListAddr := app.buffMonitor.GetBuffListAddr(playerAddr)
 					app.buffInjector.SetBuffListAddr(buffListAddr)
 				}
@@ -701,8 +875,10 @@ func (app *App) pollHotkeys() {
 				app.autospamWindow.Toggle()
 			}
 		},
-		0x7A: func() { // F11
-			app.printDiagnostics()
+		0x7A: func() { // F11 - Fishing Bot Window
+			if app.fishingWindow != nil {
+				app.fishingWindow.Toggle()
+			}
 		},
 		0x7B: func() { // F12
 			if app.espManager != nil {
@@ -764,16 +940,6 @@ func (app *App) pollHotkeys() {
 				fmt.Printf("[ESP] Recheck Panel: %s\n", status)
 			}
 		},
-		0x22: func() { // PAGE DOWN - Toggle Demolition panel
-			if app.espManager != nil {
-				enabled := app.espManager.ToggleDemolitionPanel()
-				status := "OFF"
-				if enabled {
-					status = "ON"
-				}
-				fmt.Printf("[ESP] Demolition Panel: %s\n", status)
-			}
-		},
 		0xDE: func() { // ' (single quote) - Next house filter type
 			if app.espManager != nil {
 				app.espManager.NextHouseFilterType()
@@ -800,6 +966,11 @@ func (app *App) pollHotkeys() {
 		0x13: func() { // PAUSE - Trigger scan
 			if app.targetScanner != nil && app.targetScanner.IsScanning() {
 				app.targetScanner.ScanForChanges("TARGET_CHANGE")
+			}
+		},
+		0x22: func() { // PAGE DOWN - Skill Config Window
+			if app.skillConfigWindow != nil {
+				app.skillConfigWindow.Toggle()
 			}
 		},
 		0x2E: func() { // DELETE - Toggle Bot ON/OFF
@@ -847,6 +1018,10 @@ func (app *App) pollHotkeys() {
 				app.botInstance.PrintStats()
 			}
 		},
+		0x68: func() { // NUMPAD8 - Diagnostics
+			app.printDiagnostics()
+		},
+
 	}
 
 	for vk, callback := range keys {
@@ -973,6 +1148,25 @@ func (app *App) getDisplayLines() []string {
 	lines = append(lines, "────────────────────────────────────────────────────────")
 	lines = append(lines, app.getBotDisplayLine())
 
+	// ==================== FISHING STATUS LINE ====================
+	if app.fishingBot != nil {
+		fishStatus := "OFF"
+		if app.fishingBot.IsRunning() {
+			stats := app.fishingBot.GetStats()
+			fishStatus = fmt.Sprintf("ON | R:%d", stats.ReactionsTriggered)
+		}
+		lines = append(lines, fmt.Sprintf("[F11] Fish:%s", fishStatus))
+	}
+
+	// ==================== SKILL STATUS LINE ====================
+	if app.skillMonitor != nil {
+		skillStatus := "OFF"
+		if app.skillMonitor.Hooked && app.skillMonitor.Enabled {
+			skillStatus = fmt.Sprintf("ON | Casts:%d", app.skillMonitor.CastCount)
+		}
+		lines = append(lines, fmt.Sprintf("[PGDN] Skills:%s", skillStatus))
+	}
+
 	return lines
 }
 
@@ -1036,6 +1230,13 @@ func (app *App) printDiagnostics() {
 	if app.targetMonitor != nil {
 		fmt.Println("\n[SCANNING TARGET HP OFFSETS...]")
 		app.targetMonitor.DebugScanHP()
+		app.targetMonitor.DebugTargetBuffs()
+	}
+
+	// Debug faction offset scan
+	if app.espManager != nil {
+		fmt.Println("\n[SCANNING ENTITY FACTION OFFSETS...]")
+		app.espManager.DebugEntityFaction()
 	}
 
 	fmt.Printf("\n[CONNECTION]\n")
@@ -1150,6 +1351,18 @@ func (app *App) printDiagnostics() {
 		}
 	}
 
+	if app.skillMonitor != nil {
+		fmt.Printf("\n[SKILL MONITOR]\n")
+		fmt.Printf("  Hooked: %v\n", app.skillMonitor.Hooked)
+		fmt.Printf("  Enabled: %v\n", app.skillMonitor.Enabled)
+		fmt.Printf("  Last Skill: %d\n", app.skillMonitor.LastSkillID)
+		fmt.Printf("  Cast Count: %d\n", app.skillMonitor.CastCount)
+		if app.skillReactionManager != nil {
+			fmt.Printf("  Reactions Enabled: %v\n", app.skillReactionManager.IsEnabled())
+			fmt.Printf("  Reactions Count: %d\n", len(app.skillReactionManager.GetAllReactions()))
+		}
+	}
+
 	if app.espManager != nil {
 		fmt.Printf("\n[ESP TARGET DEBUG]\n")
 		app.espManager.DebugTargetInfo()
@@ -1158,7 +1371,7 @@ func (app *App) printDiagnostics() {
 	}
 
 	fmt.Println("\n════════════════════════════════════════")
-	fmt.Println("Press F11 again to refresh.")
+	fmt.Println("Press NUMPAD8 again to refresh.")
 	fmt.Println("════════════════════════════════════════")
 }
 
@@ -1199,9 +1412,22 @@ func findWindowByPID(targetPID uint32) uintptr {
 func (app *App) Close() {
 	close(app.stopChan)
 
+
 	// Stop bot
 	if app.botInstance != nil && app.botInstance.IsRunning() {
 		app.botInstance.Stop()
+	}
+
+	// Stop fishing bot
+	if app.fishingBot != nil && app.fishingBot.IsRunning() {
+		app.fishingBot.Stop()
+	}
+
+	// Remove skill hooks (restore original bytes BEFORE closing handle)
+	if app.skillMonitor != nil {
+		fmt.Println("[SKILL] Removendo hooks...")
+		app.skillMonitor.Close()
+		fmt.Println("[SKILL] Hooks removidos e bytes restaurados")
 	}
 
 	if app.inputManager != nil && app.inputManager.IsAutoSpamming() {
@@ -1222,9 +1448,6 @@ func (app *App) Close() {
 	if app.espManager != nil {
 		app.espManager.Close()
 	}
-	if app.skillMonitor != nil {
-		app.skillMonitor.Close()
-	}
 	if app.patchManager != nil {
 		app.patchManager.RestoreAll()
 	}
@@ -1242,12 +1465,14 @@ func main() {
 	fmt.Println("║  F1: Loot | F2: Doodad | F3: Spam    ║")
 	fmt.Println("║  F4: Auto | F5: Reload | F6: React   ║")
 	fmt.Println("║  F7: Config | F8: Buffs | F9: Quick  ║")
-	fmt.Println("║  F10: BotCfg | F11: Diag | F12: ESP  ║")
+	fmt.Println("║  F10: BotCfg | F11: Fish | F12: ESP  ║")
 	fmt.Println("║  HOME: Style | END: Hide             ║")
 	fmt.Println("╠═══════════════════════════════════════╣")
-	fmt.Println("║  DEL: Bot ON/OFF                     ║")
+	fmt.Println("║  DEL: Bot ON/OFF | PGDN: Skills      ║")
 	fmt.Println("║  NUM1-3: Mob Presets | NUM4: Reload  ║")
 	fmt.Println("║  NUM+/-: Range | NUM5: Match Mode    ║")
+	fmt.Println("╠═══════════════════════════════════════╣")
+	fmt.Println("║  Ctrl+R: Record | Ctrl+T: Run Route  ║")
 	fmt.Println("╚═══════════════════════════════════════╝")
 	fmt.Println()
 
@@ -1262,6 +1487,21 @@ func main() {
 	} else {
 		fmt.Println("[OK] Rodando como Administrador")
 	}
+
+	// Print active features
+	fmt.Println()
+	fmt.Print("[FEATURES] ")
+	features := map[string]string{
+		"Loot": featureLoot, "Patches": featurePatches, "Reactions": featureReactions,
+		"Buffs": featureBuffs, "ESP": featureESP, "Bot": featureBot,
+		"Keyspam": featureKeyspam,
+	}
+	for name, flag := range features {
+		if feat(flag) {
+			fmt.Printf("%s:ON ", name)
+		}
+	}
+	fmt.Println()
 
 	app, err := NewApp()
 	if err != nil {
