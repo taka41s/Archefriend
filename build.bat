@@ -1,6 +1,8 @@
 @echo off
 setlocal enabledelayedexpansion
 
+cd /d %~dp0
+
 echo ========================================
 echo   ArcheFriend Build Script
 echo ========================================
