@@ -29,7 +29,7 @@ func NewOverlayWindow(width, height int) (*OverlayWindow, error) {
 		height:  height,
 	}
 
-	className, _ := syscall.UTF16PtrFromString("ArcheFriendOverlay")
+	className, _ := syscall.UTF16PtrFromString("OvMainClass")
 	w.className = className
 
 	hInstance, _, _ := procGetModuleHandle.Call(0)
@@ -46,7 +46,7 @@ func NewOverlayWindow(width, height int) (*OverlayWindow, error) {
 		return nil, fmt.Errorf("failed to register window class")
 	}
 
-	windowName, _ := syscall.UTF16PtrFromString("ArcheFriend")
+	windowName, _ := syscall.UTF16PtrFromString("Overlay")
 
 	hwnd, _, _ := procCreateWindowExW.Call(
 		WS_EX_LAYERED|WS_EX_TOPMOST|WS_EX_TOOLWINDOW,

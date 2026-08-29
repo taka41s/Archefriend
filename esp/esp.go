@@ -130,9 +130,10 @@ const (
 	targetBase = 0x3AB81E98
 
 	// Player target offsets
+	// Z-up: Y = north (horizontal), Z = height (up)
 	playerTargetPosX = 0x6A4
-	playerTargetPosY = 0x6AC
-	playerTargetPosZ = 0x6A8
+	playerTargetPosY = 0x6A8 // north
+	playerTargetPosZ = 0x6AC // height (up)
 
 	// Target type flag: 1 = mob/NPC, 0 = player
 	targetTypeFlag = 0x028
@@ -156,9 +157,10 @@ const (
 const (
 	PTR_LOCALPLAYER   uintptr = 0xE9DC54
 	OFF_PLAYER_ENTITY uint32  = 0x10
-	OFF_POS_X         uint32  = 0x830
-	OFF_POS_Z         uint32  = 0x834
-	OFF_POS_Y         uint32  = 0x838
+	// Z-up (CryEngine native): X=east, Y=north, Z=height/altitude
+	OFF_POS_X         uint32  = 0x830 // east
+	OFF_POS_Y         uint32  = 0x834 // north
+	OFF_POS_Z         uint32  = 0x838 // height (up)
 )
 
 // ============================================================================
@@ -234,6 +236,26 @@ type Manager struct {
 
 	// House ESP (separate module)
 	houseManager *HouseESPManager
+
+	// Doodad scanner (chests / packs / ginseng) — feeds the radar
+	doodadManager *DoodadESPManager
+
+	// Radar 2D (minimapa)
+	radar *Radar
+
+	// Cached seamless origin (floating-origin grid), refreshed ~1x/sec so the
+	// per-frame HUD/absolute-coord math doesn't pay a CreateRemoteThread each frame.
+	originGridX int32
+	originGridY int32
+	originTick  int
+
+	// Route waypoints to draw in-world via W2S (ABSOLUTE coords). Set by the
+	// recorder in main.go; drawn in the render loop like entity ESP markers.
+	routeWP [][3]float32
+	routeMu sync.Mutex
+
+	// Fired when a click on the radar places a waypoint (build mode). Absolute coords.
+	onWaypointPlaced func(wxAbs, wyAbs float32)
 
 
 	// Mutex for WorldToScreen (prevents race condition between ESP and Aimbot)
@@ -366,6 +388,10 @@ func NewManager(processHandle uintptr, pid uint32, x2game uintptr) (*Manager, er
 	// Create separate module for House ESP
 	m.houseManager = NewHouseESPManager(m, processHandle, x2game)
 
+	// Doodad scanner + radar (chests / packs / ginseng on a 2D minimap)
+	m.doodadManager = NewDoodadESPManager(x2game, m)
+	m.radar = NewRadar()
+
 	// Allocate shellcode
 	if err := m.allocateShellcode(); err != nil {
 		return nil, err
@@ -387,7 +413,7 @@ func NewManager(processHandle uintptr, pid uint32, x2game uintptr) (*Manager, er
 	m.screenH = gameRect.Bottom - gameRect.Top
 
 	// Create overlay with WS_EX_NOACTIVATE to prevent focus stealing
-	className := syscall.StringToUTF16Ptr("ArcheFriendESP")
+	className := syscall.StringToUTF16Ptr("OvViewClass")
 	wc := WNDCLASSEXW{
 		Size:      uint32(unsafe.Sizeof(WNDCLASSEXW{})),
 		WndProc:   syscall.NewCallback(wndProc),
@@ -528,6 +554,10 @@ func (m *Manager) Close() {
 	if m.houseManager != nil {
 		m.houseManager.Stop()
 	}
+	// Stop doodad scanner if running
+	if m.doodadManager != nil {
+		m.doodadManager.Stop()
+	}
 	if m.font != 0 {
 		procDeleteObject.Call(m.font)
 	}
@@ -585,11 +615,32 @@ func (m *Manager) GetPlayerPosition() (float32, float32, float32, bool) {
 		return 0, 0, 0, false
 	}
 
-	x := m.readFloat32(uintptr(playerAddr) + uintptr(OFF_POS_X))
-	z := m.readFloat32(uintptr(playerAddr) + uintptr(OFF_POS_Z))
-	y := m.readFloat32(uintptr(playerAddr) + uintptr(OFF_POS_Y))
+	x := m.readFloat32(uintptr(playerAddr) + uintptr(OFF_POS_X)) // east
+	y := m.readFloat32(uintptr(playerAddr) + uintptr(OFF_POS_Y)) // north
+	z := m.readFloat32(uintptr(playerAddr) + uintptr(OFF_POS_Z)) // height (up)
 
 	return x, y, z, true
+}
+
+// GetPlayerPositionAbsolute returns the STABLE absolute world position
+// (local + seamlessOrigin) using the cached origin grid, so routes are invariant
+// across the game's floating-origin rebases. Same convention as
+// GetPlayerPosition (X=east, Y=north, Z=height).
+func (m *Manager) GetPlayerPositionAbsolute() (x, y, z float32, ok bool) {
+	lx, ly, lz, valid := m.GetPlayerPosition()
+	if !valid {
+		return 0, 0, 0, false
+	}
+	return lx + float32(m.originGridX)*1024, ly + float32(m.originGridY)*1024, lz, true
+}
+
+// SetRouteWaypoints replaces the in-world route waypoints (ABSOLUTE coords).
+func (m *Manager) SetRouteWaypoints(wps [][3]float32) {
+	m.routeMu.Lock()
+	cp := make([][3]float32, len(wps))
+	copy(cp, wps)
+	m.routeWP = cp
+	m.routeMu.Unlock()
 }
 
 // WorldToScreen converts world coordinates to screen
@@ -925,6 +976,28 @@ func (m *Manager) renderLoop() {
 		// 1. Limpa o back buffer
 		m.clearBackBuffer()
 
+		// Always-on player HUD: zone id, grid, local + ABSOLUTE world coords.
+		{
+			// Refresh the seamless origin ~1x/sec (CreateRemoteThread — throttled).
+			if m.originTick <= 0 {
+				m.originTick = 120
+				if gx, gy, ok := m.GetSeamlessOrigin(); ok {
+					m.originGridX, m.originGridY = gx, gy
+				}
+			} else {
+				m.originTick--
+			}
+			zoneStr := "?"
+			if zid, ok := m.GetZoneID(); ok {
+				zoneStr = fmt.Sprintf("%d", zid)
+			}
+			absX := playerX + float32(m.originGridX)*1024
+			absY := playerY + float32(m.originGridY)*1024
+			m.drawText(12, 12, fmt.Sprintf("Zone %s   grid(%d,%d)", zoneStr, m.originGridX, m.originGridY), COLOR_GREEN)
+			m.drawText(12, 28, fmt.Sprintf("local  X %.0f  Y %.0f  Z %.0f", playerX, playerY, playerZ), COLOR_GREEN)
+			m.drawText(12, 44, fmt.Sprintf("abs    X %.0f  Y %.0f", absX, absY), COLOR_YELLOW)
+		}
+
 		// Target ESP (always active when has target)
 		targetX, targetY, targetZ, hasTarget := m.GetTarget()
 		if hasTarget {
@@ -934,8 +1007,8 @@ func (m *Manager) renderLoop() {
 			// Color based on distance
 			color := GetColorByDistance(distance)
 
-			// WorldToScreen (order: X, Z, Y)
-			screenX, screenY, screenZ := m.WorldToScreen(targetX, targetZ, targetY)
+			// WorldToScreen (Z-up: pass X, Y=north, Z=height)
+			screenX, screenY, screenZ := m.WorldToScreen(targetX, targetY, targetZ)
 
 			// Filter target behind camera (screenZ >= 1.0 = behind)
 			isInvalidZ := math.IsNaN(float64(screenZ)) || math.IsInf(float64(screenZ), 0)
@@ -1017,8 +1090,8 @@ func (m *Manager) renderLoop() {
 						continue
 					}
 				}
-				// WorldToScreen (order: X, Z, Y)
-				screenX, screenY, screenZ := m.WorldToScreen(entity.PosX, entity.PosZ, entity.PosY)
+				// WorldToScreen (Z-up: pass X, Y=north, Z=height)
+				screenX, screenY, screenZ := m.WorldToScreen(entity.PosX, entity.PosY, entity.PosZ)
 
 				// Filter entities behind camera (screenZ >= 1.0 = behind)
 				isInvalidZ := math.IsNaN(float64(screenZ)) || math.IsInf(float64(screenZ), 0)
@@ -1083,20 +1156,83 @@ func (m *Manager) renderLoop() {
 			m.drawFilterUI()
 		}
 
-		// House ESP rendering
+		// House ESP rendering. The house subsystem stays Y-up internally, so
+		// feed it (X, height, north) = (playerX, playerZ, playerY).
 		if m.houseManager != nil && m.houseManager.IsEnabled() && isVisible != 0 {
-			m.renderHouses(playerX, playerY, playerZ)
+			m.renderHouses(playerX, playerZ, playerY)
 			m.drawHouseFilterUI()
 			m.drawRecheckPanel()
 			m.drawDemolitionPanel()
 
-			// Sextant display (top-center)
-			if sext, ok := m.houseManager.GetPlayerSextant(playerX, playerZ); ok {
-				label := fmt.Sprintf("(%.0f, %.0f) %s", playerX, playerZ, sext)
+			// Sextant display (top-center) — playerY is north.
+			if sext, ok := m.houseManager.GetPlayerSextant(playerX, playerY); ok {
+				label := fmt.Sprintf("(%.0f, %.0f) %s", playerX, playerY, sext)
 				m.drawText(m.screenW/2-150, 30, label, COLOR_YELLOW)
 			} else {
-				m.drawText(m.screenW/2-150, 30, fmt.Sprintf("(%.0f, %.0f) [no cal]", playerX, playerZ), COLOR_RED)
+				m.drawText(m.screenW/2-150, 30, fmt.Sprintf("(%.0f, %.0f) [no cal]", playerX, playerY), COLOR_RED)
 			}
+		}
+
+		// Route waypoints — drawn in the world via W2S, like entity ESP markers.
+		// Absolute coords -> local (subtract cached origin) -> WorldToScreen.
+		// Distance-culled + decimated + a per-frame W2S budget (W2S is a
+		// CreateRemoteThread each call, so we can't project hundreds/frame).
+		{
+			m.routeMu.Lock()
+			wps := m.routeWP
+			m.routeMu.Unlock()
+			if len(wps) > 0 {
+				ox := float32(m.originGridX) * 1024
+				oy := float32(m.originGridY) * 1024
+				const wpRangeSq = 100.0 * 100.0
+				const wpStep = 3
+				w2sBudget := 24
+				colDot := rgb(80, 255, 80)
+				colLine := rgb(0, 200, 255)
+				var prevX, prevY int32
+				havePrev := false
+				for i := 0; i < len(wps); i += wpStep {
+					if w2sBudget <= 0 {
+						break
+					}
+					lx := wps[i][0] - ox
+					ly := wps[i][1] - oy
+					lz := wps[i][2]
+					ddx := lx - playerX
+					ddy := ly - playerY
+					if ddx*ddx+ddy*ddy > wpRangeSq {
+						havePrev = false
+						continue
+					}
+					sx, sy, sz := m.WorldToScreen(lx, ly, lz)
+					w2sBudget--
+					if math.IsNaN(float64(sz)) || sz >= 1.0 || sx < 0 || sx > 100 || sy < 0 || sy > 100 {
+						havePrev = false
+						continue
+					}
+					px := int32(sx * float32(m.screenW) / 100.0)
+					py := int32(sy * float32(m.screenH) / 100.0)
+					if havePrev {
+						m.drawLine(prevX, prevY, px, py, colLine, 2)
+					}
+					fillEllipse(m.backDC, px, py, 4, colDot)
+					prevX, prevY = px, py
+					havePrev = true
+				}
+			}
+		}
+
+		// Radar 2D (minimapa) — desenhado por último, sobre tudo.
+		if m.radar != nil && m.radar.Visible {
+			var ents []EntityInfo
+			if m.allEntitiesManager != nil {
+				ents = m.allEntitiesManager.GetCachedEntities()
+			}
+			var doods []DoodadEntry
+			if m.doodadManager != nil {
+				doods = m.doodadManager.GetCachedDoodads()
+			}
+			m.drawRadar(playerX, playerY, ents, doods)
 		}
 
 		// 3. Copy back buffer to screen at once (no flicker)
@@ -1124,6 +1260,12 @@ func (m *Manager) processMouseInput() {
 
 	// Detect click (press and release)
 	if isPressed && !m.lastMouseState {
+
+		// Route builder: a click inside the radar (build mode) places a waypoint.
+		if m.handleRadarClick(pt.X, pt.Y) {
+			m.lastMouseState = true
+			return
+		}
 
 		// Check if click is on Players checkbox
 		if m.isPointInCheckbox(pt.X, pt.Y, m.checkboxPlayerX, m.checkboxPlayerY) {
@@ -1258,6 +1400,15 @@ func (m *Manager) isPointInButton(px, py, bx, by, size int32) bool {
 
 // isMouseOverUI checks if mouse is over UI area (filter panel)
 func (m *Manager) isMouseOverUI(px, py int32) bool {
+	// Route builder: the radar is clickable while in build mode (so the click is
+	// captured by the overlay instead of passing through to the game).
+	if m.radar != nil && m.radar.Visible && m.radar.BuildMode && m.radar.geoValid {
+		dx := float32(px - m.radar.geoCx)
+		dy := float32(py - m.radar.geoCy)
+		if dx*dx+dy*dy <= m.radar.geoRadius*m.radar.geoRadius {
+			return true
+		}
+	}
 	if !m.uiVisible {
 		return false
 	}
@@ -1765,8 +1916,8 @@ func (m *Manager) AimAtTargetDebug(debug bool) bool {
 		return false
 	}
 
-	// WorldToScreen (order: X, Z, Y)
-	screenX, screenY, screenZ := m.WorldToScreen(targetX, targetZ, targetY)
+	// WorldToScreen (Z-up: pass X, Y=north, Z=height)
+	screenX, screenY, screenZ := m.WorldToScreen(targetX, targetY, targetZ)
 
 	// Filter target behind camera (screenZ >= 1.0 = behind)
 	isInvalidZ := math.IsNaN(float64(screenZ)) || math.IsInf(float64(screenZ), 0)

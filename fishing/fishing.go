@@ -1,7 +1,7 @@
 package fishing
 
 import (
-	"archefriend/input"
+	"winkit/input"
 	"encoding/json"
 	"fmt"
 	"os"

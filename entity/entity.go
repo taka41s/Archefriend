@@ -1,8 +1,8 @@
 package entity
 
 import (
-	"archefriend/config"
-	"archefriend/memory"
+	"winkit/config"
+	"winkit/memory"
 	"golang.org/x/sys/windows"
 )
 

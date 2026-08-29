@@ -541,7 +541,9 @@ func (h *HouseESPManager) calibrateOnce() error {
 		return fmt.Errorf("code cave not ready")
 	}
 
-	playerX, _, playerZ, ok := h.mainManager.GetPlayerPosition()
+	// House subsystem is Y-up internally: its "playerZ" means north (the 2nd
+	// return of the now Z-up GetPlayerPosition).
+	playerX, playerZ, _, ok := h.mainManager.GetPlayerPosition()
 	if !ok {
 		return fmt.Errorf("no player position")
 	}
@@ -1245,7 +1247,8 @@ func (h *HouseESPManager) scanLoop() {
 }
 
 func (h *HouseESPManager) scanOnce() {
-	playerX, playerY, playerZ, hasPlayer := h.mainManager.GetPlayerPosition()
+	// Y-up island: playerZ=north (2nd return), playerY=height (3rd return).
+	playerX, playerZ, playerY, hasPlayer := h.mainManager.GetPlayerPosition()
 	if !hasPlayer {
 		if h.firstScan {
 			fmt.Println("[HOUSES] FAIL: no player position")

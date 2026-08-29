@@ -1,4 +1,4 @@
-module archefriend
+module winkit
 
 go 1.21
 

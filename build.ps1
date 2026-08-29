@@ -30,8 +30,11 @@ New-Item -ItemType Directory -Path $BUILD_DIR | Out-Null
 # Compila o projeto
 Write-Host ""
 Write-Host "Compilando projeto..." -ForegroundColor Green
+# Alvo 32-bit (casa com o ArcheAge) + -trimpath (nao embute o path absoluto no binario)
+$env:GOARCH = "386"
+$env:GOOS = "windows"
 $env:CGO_ENABLED = "0"
-go build -ldflags="-s -w" -o "$BUILD_DIR\$EXE_NAME" main.go
+go build -trimpath -ldflags="-s -w" -o "$BUILD_DIR\$EXE_NAME" main.go
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""

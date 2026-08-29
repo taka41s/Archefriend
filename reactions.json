@@ -5,7 +5,8 @@
     "onStart": "F10",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 156,
@@ -13,7 +14,8 @@
     "onStart": "F11",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 243,
@@ -21,7 +23,8 @@
     "onStart": "F10",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 449,
@@ -29,7 +32,8 @@
     "onStart": "F10",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 501,
@@ -37,7 +41,8 @@
     "onStart": "F10",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 2113,
@@ -45,7 +50,8 @@
     "onStart": "ALT+Q \u0026 ALT+E",
     "onEnd": "ALT+2",
     "isDebuff": false,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 2458,
@@ -53,7 +59,8 @@
     "onStart": "ALT+4",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 3601,
@@ -61,7 +68,8 @@
     "onStart": "F10",
     "onEnd": "F3",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 6148,
@@ -69,7 +77,8 @@
     "onStart": "ALT+Q \u0026 ALT+E",
     "onEnd": "",
     "isDebuff": false,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 6829,
@@ -77,7 +86,8 @@
     "onStart": "F11",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 6860,
@@ -85,7 +95,8 @@
     "onStart": "F10",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 18396,
@@ -93,7 +104,8 @@
     "onStart": "F10",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 21402,
@@ -101,7 +113,8 @@
     "onStart": "F11",
     "onEnd": "",
     "isDebuff": true,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 800028,
@@ -109,7 +122,8 @@
     "onStart": "ALT+3",
     "onEnd": "",
     "isDebuff": false,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 8000033,
@@ -117,7 +131,8 @@
     "onStart": "SHIFT+5 \u0026 R",
     "onEnd": "",
     "isDebuff": false,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 8000074,
@@ -125,7 +140,8 @@
     "onStart": "LSHIFT+4",
     "onEnd": "",
     "isDebuff": false,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   },
   {
     "type": 8000281,
@@ -133,6 +149,7 @@
     "onStart": "ALT+3",
     "onEnd": "R",
     "isDebuff": false,
-    "cooldownMs": 1000
+    "cooldownMs": 1000,
+    "source": "player"
   }
 ]

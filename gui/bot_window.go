@@ -1,7 +1,7 @@
 package gui
 
 import (
-	"archefriend/bot"
+	"winkit/bot"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -96,8 +96,8 @@ func (bw *BotConfigWindow) runWindow() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	className, _ := syscall.UTF16PtrFromString("ArcheFriendBotConfigClass")
-	windowName, _ := syscall.UTF16PtrFromString("ArcheFriend - Bot Config")
+	className, _ := syscall.UTF16PtrFromString("BtCfgClass")
+	windowName, _ := syscall.UTF16PtrFromString("Bot Config")
 
 	hInstance, _, _ := procGetModuleHandle.Call(0)
 

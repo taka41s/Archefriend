@@ -104,7 +104,11 @@ if "%F_KEYSPAM%"=="false"   set LDFLAGS=%LDFLAGS% -X main.featureKeyspam=false
 echo Compilando projeto...
 echo   ldflags: %LDFLAGS%
 echo.
-go build -ldflags "%LDFLAGS%" -o %BUILD_DIR%\%EXE_NAME% main.go
+REM Alvo 32-bit (casa com o ArcheAge) + -trimpath (nao embute o path absoluto no binario)
+set GOARCH=386
+set GOOS=windows
+set CGO_ENABLED=0
+go build -trimpath -ldflags "%LDFLAGS%" -o %BUILD_DIR%\%EXE_NAME% main.go
 
 if %ERRORLEVEL% neq 0 (
     echo.

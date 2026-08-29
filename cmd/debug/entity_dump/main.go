@@ -3,8 +3,8 @@
 package main
 
 import (
-	"archefriend/esp"
-	"archefriend/process"
+	"winkit/esp"
+	"winkit/process"
 	"fmt"
 	"os"
 	"os/signal"

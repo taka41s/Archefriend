@@ -66,9 +66,9 @@ func (aem *AllEntitiesManager) DumpEntityMemory(maxEntities int) []EntityDump {
 		}
 
 		// Read position
-		posX := aem.mainManager.readFloat32(uintptr(entityPtr + 0x830))
-		posZ := aem.mainManager.readFloat32(uintptr(entityPtr + 0x834))
-		posY := aem.mainManager.readFloat32(uintptr(entityPtr + 0x838))
+		posX := aem.mainManager.readFloat32(uintptr(entityPtr + 0x830)) // east
+		posY := aem.mainManager.readFloat32(uintptr(entityPtr + 0x834)) // north
+		posZ := aem.mainManager.readFloat32(uintptr(entityPtr + 0x838)) // height (up)
 
 		if posX < 100 || posX > 50000 {
 			continue
@@ -144,7 +144,7 @@ func PrintEntityDump(dump EntityDump) {
 
 	// Print Entity MID (0x800 - 0x860) - position region
 	fmt.Println("\n--- Entity (0x800 - 0x860) - Position Region ---")
-	fmt.Println("       0x830=PosX  0x834=PosZ  0x838=PosY  0x84C=HP")
+	fmt.Println("       0x830=PosX(east)  0x834=PosY(north)  0x838=PosZ(up)  0x84C=HP")
 	printHexDump(dump.EntityMid[0x00:0x60], 0x800)
 }
 
@@ -327,9 +327,9 @@ func (aem *AllEntitiesManager) DumpFactionData(maxEntities int) []FactionDump {
 		}
 
 		// Read position
-		posX := aem.mainManager.readFloat32(uintptr(entityPtr + 0x830))
-		posZ := aem.mainManager.readFloat32(uintptr(entityPtr + 0x834))
-		posY := aem.mainManager.readFloat32(uintptr(entityPtr + 0x838))
+		posX := aem.mainManager.readFloat32(uintptr(entityPtr + 0x830)) // east
+		posY := aem.mainManager.readFloat32(uintptr(entityPtr + 0x834)) // north
+		posZ := aem.mainManager.readFloat32(uintptr(entityPtr + 0x838)) // height (up)
 
 		if posX < 100 || posX > 50000 {
 			continue
@@ -522,9 +522,9 @@ func (aem *AllEntitiesManager) DumpSingleEntityByAddr(entityAddr uint32) *Entity
 		return nil
 	}
 
-	posX := aem.mainManager.readFloat32(uintptr(entityAddr + 0x830))
-	posZ := aem.mainManager.readFloat32(uintptr(entityAddr + 0x834))
-	posY := aem.mainManager.readFloat32(uintptr(entityAddr + 0x838))
+	posX := aem.mainManager.readFloat32(uintptr(entityAddr + 0x830)) // east
+	posY := aem.mainManager.readFloat32(uintptr(entityAddr + 0x834)) // north
+	posZ := aem.mainManager.readFloat32(uintptr(entityAddr + 0x838)) // height (up)
 	hp := aem.mainManager.readU32(uintptr(entityAddr + 0x84C))
 	name := aem.mainManager.getEntityName(entityAddr)
 

@@ -1,7 +1,7 @@
 package gui
 
 import (
-	"archefriend/skill"
+	"winkit/skill"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -88,8 +88,8 @@ func (sw *SkillConfigWindow) runWindow() {
 	defer runtime.UnlockOSThread()
 
 	// Register window class
-	className, _ := syscall.UTF16PtrFromString("ArcheFriendSkillConfigClass")
-	windowName, _ := syscall.UTF16PtrFromString("ArcheFriend - Skill Reactions")
+	className, _ := syscall.UTF16PtrFromString("SkCfgClass")
+	windowName, _ := syscall.UTF16PtrFromString("Skill Reactions")
 
 	hInstance, _, _ := procGetModuleHandle.Call(0)
 

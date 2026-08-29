@@ -8,7 +8,8 @@
     "loot_bypass": "F1",
     "doodad_bypass": "F2",
     "input_spam_once": "F3",
-    "input_spam_toggle": "F4"
+    "input_spam_toggle": "F4",
+    "slave_summon_space_bypass": "SHIFT+8"
   },
   "windows": {
     "config_window": "F7",

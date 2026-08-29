@@ -1,8 +1,8 @@
 package loot
 
 import (
-	"archefriend/config"
-	"archefriend/memory"
+	"winkit/config"
+	"winkit/memory"
 	"fmt"
 
 	"golang.org/x/sys/windows"

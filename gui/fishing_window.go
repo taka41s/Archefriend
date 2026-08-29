@@ -1,7 +1,7 @@
 package gui
 
 import (
-	"archefriend/fishing"
+	"winkit/fishing"
 	"fmt"
 	"runtime"
 	"strings"
@@ -67,8 +67,8 @@ func (fw *FishingWindow) runWindow() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	className, _ := syscall.UTF16PtrFromString("ArcheFriendFishingClass")
-	windowName, _ := syscall.UTF16PtrFromString("ArcheFriend - Sport Fishing Bot")
+	className, _ := syscall.UTF16PtrFromString("FsCfgClass")
+	windowName, _ := syscall.UTF16PtrFromString("Sport Fishing Bot")
 
 	hInstance, _, _ := procGetModuleHandle.Call(0)
 

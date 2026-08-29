@@ -109,6 +109,40 @@ func (m *Manager) ApplyAll() {
 	fmt.Printf("[PATCH] %d patches aplicados\n", len(m.patches))
 }
 
+// Toggle liga/desliga um patch nomeado em runtime e retorna o novo estado
+// (true = ativo). Na primeira chamada captura os bytes originais e aplica;
+// nas seguintes alterna entre patch e original. Usado por hotkeys.
+func (m *Manager) Toggle(name string, addr uintptr, patch []byte) bool {
+	for i := range m.patches {
+		p := &m.patches[i]
+		if p.Name == name {
+			if p.Active {
+				m.writeBytes(p.Addr, p.Original)
+				p.Active = false
+				fmt.Printf("[PATCH] %s @ 0x%X [OFF]\n", name, addr)
+			} else {
+				m.writeBytes(p.Addr, p.Bytes)
+				p.Active = true
+				fmt.Printf("[PATCH] %s @ 0x%X [ON]\n", name, addr)
+			}
+			return p.Active
+		}
+	}
+
+	// primeira vez: apply() captura o original e liga
+	return m.apply(name, addr, patch)
+}
+
+// IsActive informa se um patch nomeado está atualmente aplicado.
+func (m *Manager) IsActive(name string) bool {
+	for i := range m.patches {
+		if m.patches[i].Name == name {
+			return m.patches[i].Active
+		}
+	}
+	return false
+}
+
 // RestoreAll restaura todos os patches pros bytes originais
 func (m *Manager) RestoreAll() {
 	for i := len(m.patches) - 1; i >= 0; i-- {

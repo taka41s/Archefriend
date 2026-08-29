@@ -1,7 +1,7 @@
 package gui
 
 import (
-	"archefriend/reaction"
+	"winkit/reaction"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -75,8 +75,8 @@ func (cw *ConfigWindow) runWindow() {
 	defer runtime.UnlockOSThread()
 
 	// Register window class
-	className, _ := syscall.UTF16PtrFromString("ArcheFriendConfigClass")
-	windowName, _ := syscall.UTF16PtrFromString("ArcheFriend - Reaction Config")
+	className, _ := syscall.UTF16PtrFromString("RcCfgClass")
+	windowName, _ := syscall.UTF16PtrFromString("Reaction Config")
 
 	hInstance, _, _ := procGetModuleHandle.Call(0)
 

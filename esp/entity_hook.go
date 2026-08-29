@@ -18,9 +18,10 @@ const (
 	OFF_ACTORMODEL_ENTITYPTR = 0x1F8
 
 	// Entity offsets
+	// Z-up: X=east, Y=north, Z=height (up)
 	OFF_ENTITY_POS_X = 0x830
-	OFF_ENTITY_POS_Z = 0x834
-	OFF_ENTITY_POS_Y = 0x838
+	OFF_ENTITY_POS_Y = 0x834 // north
+	OFF_ENTITY_POS_Z = 0x838 // height (up)
 	OFF_ENTITY_HP    = 0x84C
 )
 

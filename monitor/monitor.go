@@ -1,8 +1,8 @@
 package monitor
 
 import (
-	"archefriend/config"
-	"archefriend/memory"
+	"winkit/config"
+	"winkit/memory"
 	"fmt"
 	"time"
 	"unsafe"

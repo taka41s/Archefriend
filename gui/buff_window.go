@@ -1,7 +1,7 @@
 package gui
 
 import (
-	"archefriend/buff"
+	"winkit/buff"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -86,8 +86,8 @@ func (bw *BuffWindow) runWindow() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	className, _ := syscall.UTF16PtrFromString("ArcheFriendBuffClass")
-	windowName, _ := syscall.UTF16PtrFromString("ArcheFriend - Buff Injector")
+	className, _ := syscall.UTF16PtrFromString("BfCfgClass")
+	windowName, _ := syscall.UTF16PtrFromString("Buff Injector")
 
 	hInstance, _, _ := procGetModuleHandle.Call(0)
 

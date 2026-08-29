@@ -1,25 +1,23 @@
+//go:build windows
 // +build windows
 
 package main
 
 import (
-	"archefriend/afk"
-	"archefriend/bot"
-	"archefriend/buff"
-	"archefriend/config"
-	"archefriend/entity"
-	"archefriend/esp"
-	"archefriend/fishing"
-	"archefriend/gui"
-	"archefriend/input"
-	"archefriend/loot"
-	"archefriend/monitor"
+	"winkit/afk"
+	"winkit/bot"
+	"winkit/buff"
+	"winkit/config"
+	"winkit/entity"
+	"winkit/esp"
+	"winkit/fishing"
+	"winkit/gui"
+	"winkit/input"
+	"winkit/loot"
+	"winkit/memory"
+	"winkit/monitor"
+	"winkit/move"
 
-	"archefriend/patch"
-	"archefriend/process"
-	"archefriend/reaction"
-	"archefriend/skill"
-	"archefriend/target"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -29,15 +27,21 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+	"winkit/patch"
+	"winkit/process"
+	"winkit/reaction"
+	"winkit/route"
+	"winkit/skill"
+	"winkit/target"
 
 	"golang.org/x/sys/windows"
 )
 
 // AppSettings holds configurable paths loaded from settings.json
 type AppSettings struct {
-	LuaExportPath    string `json:"lua_export_path"`
-	SkillCastOffset  string `json:"skill_cast_offset"`  // Hex offset for skill cast hook (e.g. "0x1A2B3C")
-	SkillTryOffset   string `json:"skill_try_offset"`   // Hex offset for skill try hook (e.g. "0x1A2B3C")
+	LuaExportPath   string `json:"lua_export_path"`
+	SkillCastOffset string `json:"skill_cast_offset"` // Hex offset for skill cast hook (e.g. "0x1A2B3C")
+	SkillTryOffset  string `json:"skill_try_offset"`  // Hex offset for skill try hook (e.g. "0x1A2B3C")
 }
 
 func loadSettings() AppSettings {
@@ -64,7 +68,7 @@ var (
 	featureESP       = "true"
 	featureBot       = "true"
 
-	featureKeyspam   = "true"
+	featureKeyspam = "true"
 )
 
 func feat(flag string) bool {
@@ -79,7 +83,7 @@ type App struct {
 	pid       uint32
 	gameHwnd  uintptr
 
-	patchManager    *patch.Manager
+	patchManager *patch.Manager
 
 	lootBypass      *loot.Bypass
 	inputManager    *input.Manager
@@ -90,36 +94,48 @@ type App struct {
 	targetMonitor   *target.Monitor
 	buffInjector    *buff.Injector
 	presetManager   *buff.PresetManager
-	espManager           *esp.Manager
-	keybinds             *config.KeybindsConfig
-	targetScanner        *esp.TargetScanner
+	espManager      *esp.Manager
+	keybinds        *config.KeybindsConfig
+	targetScanner   *esp.TargetScanner
 
 	// Bot
-	botInstance  *bot.Bot
-	botConfig    *bot.FileConfig
+	botInstance *bot.Bot
+	botConfig   *bot.FileConfig
 
 	// Fishing
-	fishingBot    *fishing.Bot
+	fishingBot *fishing.Bot
 
 	// Skill Hooks
 	skillMonitor         *skill.SkillMonitor
 	skillReactionManager *skill.ReactionManager
 	skillConfigWindow    *gui.SkillConfigWindow
 
-	window            *gui.OverlayWindow
-	configWindow      *gui.ConfigWindow
-	buffWindow        *gui.BuffWindow
-	autospamWindow    *gui.AutoSpamWindow
-	botConfigWindow   *gui.BotConfigWindow
-	fishingWindow     *gui.FishingWindow
-	visible           bool
-	keyStates    map[int]bool
-	frameCount   int
+	window          *gui.OverlayWindow
+	configWindow    *gui.ConfigWindow
+	buffWindow      *gui.BuffWindow
+	autospamWindow  *gui.AutoSpamWindow
+	botConfigWindow *gui.BotConfigWindow
+	fishingWindow   *gui.FishingWindow
+	routesWindow    *gui.RoutesWindow
+	visible         bool
+	keyStates       map[int]bool
+	frameCount      int
 
 	stopChan         chan struct{}
 	hotkeyHeartbeat  time.Time
 	monitorHeartbeat time.Time
 	heartbeatMu      sync.Mutex
+
+	// Movement controller (WASD walk-to-point)
+	moveController *move.Controller
+	moveDestX      float32
+	moveDestY      float32
+	moveDestSet    bool
+
+	// Route recorder (waypoints in ABSOLUTE coords)
+	recording   bool
+	routePoints [][3]float32
+	recordMu    sync.Mutex
 }
 
 func NewApp() (*App, error) {
@@ -136,6 +152,14 @@ func NewApp() (*App, error) {
 		kb = &config.KeybindsConfig{}
 	}
 	app.keybinds = kb
+
+	// Movement controller. Drives the game via PostMessage-to-window (the same
+	// path the reactions use — accepted where external SendInput is filtered).
+	app.moveController = move.New(
+		move.DefaultKeys(),
+		func(vk uint16) { input.HoldKeyWindow(app.gameHwnd, vk) },
+		func(vk uint16) { input.ReleaseKeyWindow(app.gameHwnd, vk) },
+	)
 
 	pid, err := process.FindProcess("archeage.exe")
 	if err != nil {
@@ -226,12 +250,23 @@ func NewApp() (*App, error) {
 			espMgr.ToggleAllEntities()
 			fmt.Println("[ESP] Target ESP e All Entities ESP iniciados automaticamente")
 
+			// Route builder: clicking the radar (build mode) appends a waypoint to
+			// the same buffer the recorder uses (so Salvar/Salvar esparso persist it).
+			espMgr.SetWaypointPlacedCallback(func(ax, ay float32) {
+				app.recordMu.Lock()
+				app.routePoints = append(app.routePoints, [3]float32{ax, ay, 0})
+				cp := make([][3]float32, len(app.routePoints))
+				copy(cp, app.routePoints)
+				app.recordMu.Unlock()
+				espMgr.SetRouteWaypoints(cp)
+				fmt.Printf("[BUILD] waypoint %d @ (%.0f, %.0f)\n", len(cp), ax, ay)
+			})
+
 			if settings.LuaExportPath != "" {
 				espMgr.SetLuaExportPath(settings.LuaExportPath)
 			}
 		}
 	}
-
 
 	// Bot (requires ESP)
 	if feat(featureBot) {
@@ -318,7 +353,6 @@ func NewApp() (*App, error) {
 		}
 	}
 
-
 	// Autospam window (requires featureKeyspam)
 	if feat(featureKeyspam) && app.inputManager != nil {
 		autospamWindow, err := gui.NewAutoSpamWindow(app.inputManager)
@@ -365,9 +399,124 @@ func NewApp() (*App, error) {
 		fmt.Println("[FISHING] Sport Fishing Bot initialized")
 	}
 
+	app.initRoutesWindow()
 	app.startBackgroundTasks()
 
 	return app, nil
+}
+
+// ============================================================================
+// Routes CRUD window wiring
+// ============================================================================
+
+func (app *App) initRoutesWindow() {
+	rw, err := gui.NewRoutesWindow()
+	if err != nil {
+		fmt.Printf("[ROUTES] janela falhou: %v\n", err)
+		return
+	}
+	app.routesWindow = rw
+
+	rw.ListRoutes = func() []string { return route.List() }
+	rw.IsRecording = func() bool { return app.recording }
+
+	rw.OnToggleRec = func() {
+		app.recording = !app.recording
+		if app.recording {
+			fmt.Println("[REC] gravando rota...")
+		} else {
+			app.recordMu.Lock()
+			n := len(app.routePoints)
+			app.recordMu.Unlock()
+			fmt.Printf("[REC] parou (%d waypoints)\n", n)
+		}
+	}
+
+	rw.OnClearRec = func() {
+		app.recordMu.Lock()
+		app.recording = false
+		app.routePoints = nil
+		app.recordMu.Unlock()
+		if app.espManager != nil {
+			app.espManager.SetRouteWaypoints(nil)
+		}
+		fmt.Println("[REC] rota limpa")
+	}
+
+	rw.OnSave = func(name string) error {
+		app.recordMu.Lock()
+		pts := make([][3]float32, len(app.routePoints))
+		copy(pts, app.routePoints)
+		app.recordMu.Unlock()
+		if len(pts) == 0 {
+			return fmt.Errorf("nenhum waypoint gravado (grave uma rota primeiro)")
+		}
+		return route.Save(route.FromXYZ(name, pts))
+	}
+
+	rw.OnSaveSparse = func(name string) error {
+		app.recordMu.Lock()
+		pts := make([][3]float32, len(app.routePoints))
+		copy(pts, app.routePoints)
+		app.recordMu.Unlock()
+		if len(pts) == 0 {
+			return fmt.Errorf("nenhum waypoint gravado (grave uma rota primeiro)")
+		}
+		dec := route.Decimate(pts, 2.5)
+		fmt.Printf("[ROUTES] esparso: %d -> %d waypoints (epsilon=2.5)\n", len(pts), len(dec))
+		return route.Save(route.FromXYZ(name, dec))
+	}
+
+	rw.OnFollow = func(name string) error {
+		if app.moveController == nil {
+			return fmt.Errorf("controlador de movimento indisponivel")
+		}
+		r, err := route.Load(name)
+		if err != nil {
+			return err
+		}
+		pts := r.XYZ()
+		if len(pts) == 0 {
+			return fmt.Errorf("rota vazia")
+		}
+		if app.espManager != nil {
+			app.espManager.SetRouteWaypoints(pts)
+		}
+		app.moveController.FollowRoute(pts)
+		fmt.Printf("[ROUTES] seguindo '%s' (%d waypoints)\n", name, len(pts))
+		return nil
+	}
+
+	rw.OnStop = func() {
+		if app.moveController != nil {
+			app.moveController.Stop()
+		}
+	}
+
+	rw.OnDelete = func(name string) error { return route.Delete(name) }
+
+	rw.StatusText = func() string {
+		app.recordMu.Lock()
+		n := len(app.routePoints)
+		app.recordMu.Unlock()
+		parts := []string{}
+		if app.recording {
+			parts = append(parts, fmt.Sprintf("GRAVANDO (%d wp)", n))
+		}
+		if app.moveController != nil && app.moveController.IsActive() {
+			cur, tot := app.moveController.Progress()
+			parts = append(parts, fmt.Sprintf("seguindo wp %d/%d", cur, tot))
+		}
+		if len(parts) == 0 {
+			if n > 0 {
+				return fmt.Sprintf("idle (%d wp gravados, nao salvos)", n)
+			}
+			return "idle"
+		}
+		return strings.Join(parts, " | ")
+	}
+
+	fmt.Printf("[ROUTES] janela criada (Shift+7) | rotas persistem em: %s\n", route.Dir())
 }
 
 // ============================================================================
@@ -693,6 +842,7 @@ func (app *App) startBackgroundTasks() {
 	go app.hotkeyLoop()
 	go app.monitorLoop()
 	go app.watchdogLoop()
+	go app.moveLoop()
 }
 
 func (app *App) hotkeyLoop() {
@@ -715,6 +865,64 @@ func (app *App) hotkeyLoop() {
 					}
 				}()
 				app.pollHotkeys()
+			}()
+		}
+	}
+}
+
+// recordSample appends the current absolute position to the recorded route if
+// it moved at least ~1m horizontally since the last waypoint.
+func (app *App) recordSample(x, y, z float32) {
+	app.recordMu.Lock()
+	if n := len(app.routePoints); n > 0 {
+		last := app.routePoints[n-1]
+		dx, dy := x-last[0], y-last[1]
+		if dx*dx+dy*dy < 1.0 {
+			app.recordMu.Unlock()
+			return
+		}
+	}
+	app.routePoints = append(app.routePoints, [3]float32{x, y, z})
+	cp := make([][3]float32, len(app.routePoints))
+	copy(cp, app.routePoints)
+	app.recordMu.Unlock()
+	if app.espManager != nil {
+		app.espManager.SetRouteWaypoints(cp)
+	}
+}
+
+// moveLoop drives the WASD movement controller at ~60Hz (16ms), the tick
+// cadence the steering constants were tuned for.
+func (app *App) moveLoop() {
+	ticker := time.NewTicker(16 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-app.stopChan:
+			app.moveController.Stop()
+			return
+		case <-ticker.C:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Printf("[ERROR] Panic in move loop: %v\n", r)
+					}
+				}()
+				if app.espManager == nil {
+					return
+				}
+				// Route recording (absolute coords, invariant across rebases).
+				if app.recording {
+					if ax, ay, az, ok := app.espManager.GetPlayerPositionAbsolute(); ok {
+						app.recordSample(ax, ay, az)
+					}
+				}
+				// Movement controller (absolute coords — stable across rebases).
+				if app.moveController != nil && app.moveController.IsActive() {
+					if ax, ay, _, ok := app.espManager.GetPlayerPositionAbsolute(); ok {
+						app.moveController.Tick(ax, ay)
+					}
+				}
 			}()
 		}
 	}
@@ -812,6 +1020,13 @@ func (app *App) watchdogLoop() {
 func (app *App) pollHotkeys() {
 	user32 := windows.NewLazyDLL("user32.dll")
 	procGetAsyncKeyState := user32.NewProc("GetAsyncKeyState")
+
+	// shiftDown reports whether Shift is currently held — used to gate
+	// Shift+<key> chord hotkeys (50%-keyboard friendly; no numpad/PrtSc needed).
+	shiftDown := func() bool {
+		r, _, _ := procGetAsyncKeyState.Call(uintptr(input.VK_SHIFT))
+		return r&0x8000 != 0
+	}
 
 	keys := map[int]func(){
 		0x70: func() { // F1
@@ -945,6 +1160,16 @@ func (app *App) pollHotkeys() {
 				app.espManager.NextHouseFilterType()
 			}
 		},
+		0xBF: func() { // / (slash) - Toggle Radar 2D
+			if app.espManager != nil {
+				enabled := app.espManager.ToggleRadar()
+				status := "OFF"
+				if enabled {
+					status = "ON"
+				}
+				fmt.Printf("[ESP] Radar 2D: %s\n", status)
+			}
+		},
 		0x24: func() { // HOME - Cycle ESP style
 			if app.espManager != nil && app.espManager.IsEnabled() {
 				style := app.espManager.CycleStyle()
@@ -1022,6 +1247,213 @@ func (app *App) pollHotkeys() {
 			app.printDiagnostics()
 		},
 
+		// ============ MOVEMENT (WASD controller) — Shift+<num> chords ============
+		0x31: func() { // Shift+1 - input smoke test (PostMessage-to-window path)
+			if !shiftDown() {
+				return
+			}
+			if app.gameHwnd == 0 {
+				fmt.Println("[MOVE] smoke: gameHwnd=0 (janela do jogo nao encontrada)")
+				return
+			}
+			fmt.Printf("[MOVE] smoke test (PostMessage p/ hwnd=0x%X): andando pra frente ~1.5s\n", app.gameHwnd)
+			deadline := time.Now().Add(1500 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				input.HoldKeyWindow(app.gameHwnd, input.VK_W) // re-post WM_KEYDOWN (auto-repeat)
+				time.Sleep(30 * time.Millisecond)
+			}
+			input.ReleaseKeyWindow(app.gameHwnd, input.VK_W)
+			fmt.Println("[MOVE] smoke test done")
+		},
+		0x32: func() { // Shift+2 - mark current position as move destination
+			if !shiftDown() {
+				return
+			}
+			if app.espManager == nil {
+				return
+			}
+			x, y, _, ok := app.espManager.GetPlayerPositionAbsolute()
+			if !ok {
+				fmt.Println("[MOVE] mark: no player position")
+				return
+			}
+			app.moveDestX, app.moveDestY = x, y
+			app.moveDestSet = true
+			fmt.Printf("[MOVE] destination marked (%.1f, %.1f)\n", x, y)
+		},
+		0x33: func() { // Shift+3 - toggle walk to marked destination
+			if !shiftDown() {
+				return
+			}
+			if app.moveController == nil {
+				return
+			}
+			if app.moveController.IsActive() {
+				app.moveController.Stop()
+				return
+			}
+			if !app.moveDestSet {
+				fmt.Println("[MOVE] no destination marked (Shift+2 to mark)")
+				return
+			}
+			app.moveController.GoTo(app.moveDestX, app.moveDestY)
+		},
+		0x34: func() { // Shift+4 - seamless-origin diagnostic (coord absoluta)
+			if !shiftDown() {
+				return
+			}
+			if app.espManager == nil {
+				return
+			}
+			lx, ly, _, ok := app.espManager.GetPlayerPosition()
+			if !ok {
+				fmt.Println("[ORIGIN] sem posicao do player")
+				return
+			}
+			gx, gy, gok := app.espManager.GetSeamlessOrigin()
+			if !gok {
+				fmt.Println("[ORIGIN] GetSeamlessOrigin falhou (chain nao resolvida)")
+				return
+			}
+			ox, oy := float32(gx)*1024, float32(gy)*1024
+			fmt.Printf("[ORIGIN] grid=(%d,%d) origin=(%.0f,%.0f) local=(%.1f,%.1f)\n", gx, gy, ox, oy, lx, ly)
+			fmt.Printf("[ORIGIN]   local+origin=(%.1f,%.1f)  local-origin=(%.1f,%.1f)\n",
+				lx+ox, ly+oy, lx-ox, ly-oy)
+		},
+		0x35: func() { // Shift+5 - toggle route recording (draws waypoints in-world)
+			if !shiftDown() {
+				return
+			}
+			app.recording = !app.recording
+			if app.recording {
+				fmt.Println("[REC] gravando rota... (ande/dirija; Shift+5 pra parar)")
+			} else {
+				app.recordMu.Lock()
+				n := len(app.routePoints)
+				app.recordMu.Unlock()
+				fmt.Printf("[REC] parou (%d waypoints)\n", n)
+			}
+		},
+		0x36: func() { // Shift+6 - clear recorded route
+			if !shiftDown() {
+				return
+			}
+			app.recordMu.Lock()
+			app.recording = false
+			app.routePoints = nil
+			app.recordMu.Unlock()
+			if app.espManager != nil {
+				app.espManager.SetRouteWaypoints(nil)
+			}
+			fmt.Println("[REC] rota limpa")
+		},
+		0x37: func() { // Shift+7 - abre/fecha a janela de Rotas (CRUD)
+			if !shiftDown() {
+				return
+			}
+			if app.routesWindow != nil {
+				app.routesWindow.Toggle()
+			}
+		},
+		0x30: func() { // Shift+0 - liga/desliga o builder de rota no radar (clique = waypoint)
+			if !shiftDown() {
+				return
+			}
+			if app.espManager == nil {
+				return
+			}
+			on := app.espManager.ToggleRadarBuildMode()
+			fmt.Printf("[BUILD] montar rota no radar: %v (clique no radar p/ colocar waypoint; Shift+9 desfaz)\n", on)
+		},
+		0x39: func() { // Shift+9 - desfaz o ultimo waypoint colocado
+			if !shiftDown() {
+				return
+			}
+			app.recordMu.Lock()
+			if n := len(app.routePoints); n > 0 {
+				app.routePoints = app.routePoints[:n-1]
+			}
+			cp := make([][3]float32, len(app.routePoints))
+			copy(cp, app.routePoints)
+			app.recordMu.Unlock()
+			if app.espManager != nil {
+				app.espManager.SetRouteWaypoints(cp)
+			}
+			fmt.Printf("[BUILD] desfez (agora %d waypoints)\n", len(cp))
+		},
+
+		// ============ SUMMON BYPASS ============
+		0x38: func() { // Shift+8 - bypass do "Summon requires a large space"
+			if !shiftDown() {
+				return
+			}
+			if app.patchManager == nil {
+				return
+			}
+			// CheckSpaceInFront_Summon (FUN_390960c0) @ 0x39096233: query de colisao
+			// PrimitiveWorldIntersection na frente do personagem; retorna 1 se ha
+			// obstaculo. Skill_CheckCanUse faz: if (skill[0x5b] && CheckSpaceInFront()!=0)
+			// -> SkillResult 0xc = "Summon requires a large space" e bloqueia a skill.
+			// JBE(0x76) -> JMP(0xEB) => sempre retorna 0 (frente sempre livre).
+			// Funcao tem 1 unico caller, sem colateral.
+			on := app.patchManager.Toggle("SummonSpaceInFront", 0x39096233, []byte{0xEB})
+			status := "OFF"
+			if on {
+				status = "ON"
+			}
+			fmt.Printf("[PATCH] Summon 'large space' bypass: %s\n", status)
+		},
+
+		// ============ SWIM-FLY (IsInWater=true) ============
+		0x47: func() { // Shift+G - swim-fly: forca CActor::IsInWater() a retornar true
+			if !shiftDown() {
+				return
+			}
+			if app.patchManager == nil {
+				return
+			}
+			// O objeto do player JA e o CActor (pos @ +0x830). Logo:
+			//   IsInWater() = [ [player+0] + 0x68 ]  (vtable+0x68).
+			// Resolve em runtime, confirma a vtable (contem UpdateSwimStats 0x39180AD0)
+			// e patcha a funcao pra 'mov al,1; ret' -> sempre "na agua".
+			const codeLo, codeHi = 0x39001000, 0x39CF6FFF     // .text (funcoes)
+			const rdataLo, rdataHi = 0x39CF7000, 0x39E99FFF   // rdata (vtables)
+			actor := entity.GetPlayerEntityAddr(app.handle, app.x2game)
+			if actor == 0 {
+				fmt.Println("[SWIMFLY] player nao encontrado (entra no mundo primeiro)")
+				return
+			}
+			vtable := memory.ReadU32(app.handle, uintptr(actor))
+			if vtable < rdataLo || vtable > rdataHi {
+				fmt.Printf("[SWIMFLY] vtable invalida: 0x%X\n", vtable)
+				return
+			}
+			// confirma vtable do CActor procurando o ponteiro de UpdateSwimStats
+			vt := memory.ReadBytes(app.handle, uintptr(vtable), 0x1800)
+			found := false
+			for i := 0; i+4 <= len(vt); i += 4 {
+				if memory.BytesToUint32(vt[i:i+4]) == 0x39180AD0 {
+					found = true
+					break
+				}
+			}
+			if !found {
+				fmt.Printf("[SWIMFLY] vtable 0x%X nao e do CActor (UpdateSwimStats nao encontrado)\n", vtable)
+				return
+			}
+			isInWater := memory.ReadU32(app.handle, uintptr(vtable)+0x68)
+			if isInWater < codeLo || isInWater > codeHi {
+				fmt.Printf("[SWIMFLY] IsInWater ptr invalido: 0x%X\n", isInWater)
+				return
+			}
+			fmt.Printf("[SWIMFLY] CActor::IsInWater = 0x%X (RVA 0x%X)\n", isInWater, isInWater-0x39000000)
+			on := app.patchManager.Toggle("SwimFly_IsInWater", uintptr(isInWater), []byte{0xB0, 0x01, 0xC3})
+			status := "OFF"
+			if on {
+				status = "ON"
+			}
+			fmt.Printf("[PATCH] Swim-fly (IsInWater=true): %s\n", status)
+		},
 	}
 
 	for vk, callback := range keys {
@@ -1076,7 +1508,7 @@ func (app *App) getDisplayLines() []string {
 		}
 	}
 
-	lines = append(lines, fmt.Sprintf("ARCHEFRIEND [%s] | Reactions: %d", status, activeReactions))
+	lines = append(lines, fmt.Sprintf("OVERLAY [%s] | Reactions: %d", status, activeReactions))
 	lines = append(lines, fmt.Sprintf("Player: %s", playerPosStr))
 	lines = append(lines, "────────────────────────────────────────────────────────")
 
@@ -1412,7 +1844,6 @@ func findWindowByPID(targetPID uint32) uintptr {
 func (app *App) Close() {
 	close(app.stopChan)
 
-
 	// Stop bot
 	if app.botInstance != nil && app.botInstance.IsRunning() {
 		app.botInstance.Stop()
@@ -1460,7 +1891,7 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	fmt.Println("╔═══════════════════════════════════════╗")
-	fmt.Println("║      ARCHEFRIEND OVERLAY v3.7         ║")
+	fmt.Println("║             OVERLAY v3.7              ║")
 	fmt.Println("╠═══════════════════════════════════════╣")
 	fmt.Println("║  F1: Loot | F2: Doodad | F3: Spam    ║")
 	fmt.Println("║  F4: Auto | F5: Reload | F6: React   ║")

@@ -1,7 +1,7 @@
 package esp
 
 import (
-	"archefriend/config"
+	"winkit/config"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -377,9 +377,9 @@ func (aem *AllEntitiesManager) processCollectedEntities(collected map[uint32]boo
 		}
 
 		// Read position
-		posX := aem.mainManager.readFloat32(uintptr(entityPtr + 0x830))
-		posZ := aem.mainManager.readFloat32(uintptr(entityPtr + 0x834))
-		posY := aem.mainManager.readFloat32(uintptr(entityPtr + 0x838))
+		posX := aem.mainManager.readFloat32(uintptr(entityPtr + 0x830)) // east
+		posY := aem.mainManager.readFloat32(uintptr(entityPtr + 0x834)) // north
+		posZ := aem.mainManager.readFloat32(uintptr(entityPtr + 0x838)) // height (up)
 
 		// Validate position
 		if posX < 100 || posX > 50000 {

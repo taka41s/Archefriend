@@ -1,7 +1,7 @@
 package gui
 
 import (
-	"archefriend/input"
+	"winkit/input"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -62,7 +62,7 @@ func (asw *AutoSpamWindow) runWindow() {
 	defer runtime.UnlockOSThread()
 
 	// Register window class
-	className, _ := syscall.UTF16PtrFromString("ArcheFriendAutoSpamClass")
+	className, _ := syscall.UTF16PtrFromString("AsCfgClass")
 	windowName, _ := syscall.UTF16PtrFromString("AutoSpam - Configuração de Teclas")
 
 	hInstance, _, _ := procGetModuleHandle.Call(0)
