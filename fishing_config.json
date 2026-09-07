@@ -3,29 +3,27 @@
     {
       "buffId": 5264,
       "name": "RIGHT",
-      "keybind": "D"
+      "keybind": "K"
     },
     {
       "buffId": 5508,
       "name": "BIG REEL IN",
-      "keybind": "SPACE"
+      "keybind": "G"
     },
     {
       "buffId": 5267,
       "name": "ESCAPE",
-      "keybind": "S"
+      "keybind": "J"
     },
     {
       "buffId": 5265,
       "name": "LEFT",
-      "keybind": "A"
+      "keybind": "L"
     },
     {
       "buffId": 5266,
       "name": "SMALL REEL IN",
-      "keybind": "W"
+      "keybind": "H"
     }
-  ],
-  "castKey": "F",
-  "autoCast": false
+  ]
 }

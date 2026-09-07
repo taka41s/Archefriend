@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"unsafe"
 
+	"winkit/config"
+
 	"golang.org/x/sys/windows"
 )
 
 const (
-	OFFSET_SET_TARGET     uintptr = 0x1BE090
 	PTR_ENEMY_TARGET_BASE uintptr = 0x19EBF4
 	OFF_TARGET_ID         uintptr = 0x08
 
@@ -30,7 +31,7 @@ var (
 // SetTarget seleciona um target pelo UnitId usando CreateRemoteThread
 // para chamar a função SetTarget do x2game.dll (__cdecl SetTarget(int unitId, int flag))
 func SetTarget(handle windows.Handle, x2game uintptr, unitId uint32) error {
-	setTargetAddr := x2game + OFFSET_SET_TARGET
+	setTargetAddr := x2game + config.OFF_SET_TARGET_FUNC
 
 	shellcode := []byte{
 		// push 0          ; a2 = 0 (flag)

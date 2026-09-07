@@ -22,6 +22,7 @@ type FileConfig struct {
 	LootDelay    int    `json:"loot_delay"`    // ms para loot após kill
 	AutoAttack   bool   `json:"auto_attack"`   // Atacar automaticamente
 	AutoLoot     bool   `json:"auto_loot"`     // Lootar automaticamente
+	LootViaPacket bool  `json:"loot_via_packet"` // Loot via pacote direto (LootMgr_RequestLoot) em vez de keyspam
 
 	// Potion settings
 	HPPotionKey       string  `json:"hp_potion_key"`       // Ex: "5", "H"
@@ -31,6 +32,13 @@ type FileConfig struct {
 	MPPotionThreshold float32 `json:"mp_potion_threshold"` // % Mana para usar
 	MPPotionEnabled   bool    `json:"mp_potion_enabled"`
 	PotionCooldownMs  int     `json:"potion_cooldown_ms"`  // Cooldown em ms (21000 = 21s)
+
+	// Exclusão de mobs por buff (ex: 851 = mob protegido/reivindicado).
+	// Mobs com esse buff nunca entram na fila enquanto o tiverem.
+	ExcludeBuffID      uint32 `json:"exclude_buff_id"`
+	ExcludeBuffEnabled bool   `json:"exclude_buff_enabled"`
+	QueueReorgMs       int    `json:"queue_reorg_ms"`     // cadência da reorg da fila (ms)
+	BuffBlacklistMs    int    `json:"buff_blacklist_ms"` // TTL da blacklist pós-drop por buff (ms)
 
 	// Presets de mob lists (troca rápida via hotkey)
 	Presets map[string][]string `json:"presets"`
@@ -50,6 +58,7 @@ func DefaultFileConfig() FileConfig {
 		LootDelay:      300,    // 300ms para lootar após kill
 		AutoAttack:     true,   // Auto-attack ativado por padrão
 		AutoLoot:       true,   // Auto-loot ativado por padrão
+		LootViaPacket:  false,  // opt-in: valide com Shift+L antes de ligar (ver memory/loot-request-handler.md)
 		// Potion defaults
 		HPPotionKey:       "5",     // Tecla padrão HP potion
 		HPPotionThreshold: 50.0,    // Usar quando HP < 50%
@@ -58,6 +67,11 @@ func DefaultFileConfig() FileConfig {
 		MPPotionThreshold: 30.0,    // Usar quando MP < 30%
 		MPPotionEnabled:   false,   // Desabilitado por padrão
 		PotionCooldownMs:  21000,   // 21 segundos de cooldown
+		// Exclusão por buff (default: 851 ligado, reorg da fila a 50ms)
+		ExcludeBuffID:      851,
+		ExcludeBuffEnabled: true,
+		QueueReorgMs:       50,
+		BuffBlacklistMs:    15000,
 		Presets: map[string][]string{
 			"preset1": {"Young Flamingo"},
 			"preset2": {"Wandering Imp", "Forest Spider"},
@@ -105,6 +119,7 @@ func (b *Bot) ApplyFileConfig(fc *FileConfig) {
 	b.SetLootKey(fc.LootKey)
 	b.SetAutoAttack(fc.AutoAttack)
 	b.SetAutoLoot(fc.AutoLoot)
+	b.SetLootViaPacket(fc.LootViaPacket)
 	if fc.AttackDelay > 0 {
 		b.SetAttackDelay(fc.AttackDelay)
 	}
@@ -117,6 +132,10 @@ func (b *Bot) ApplyFileConfig(fc *FileConfig) {
 	if fc.PotionCooldownMs > 0 {
 		b.SetPotionCooldown(fc.PotionCooldownMs)
 	}
+	// Exclusão por buff + cadência da reorg da fila + TTL da blacklist
+	b.SetExcludeBuff(fc.ExcludeBuffID, fc.ExcludeBuffEnabled)
+	b.SetQueueReorgInterval(fc.QueueReorgMs)
+	b.SetBuffBlacklistTTL(fc.BuffBlacklistMs)
 }
 
 // LoadConfig carrega e aplica config do arquivo

@@ -86,6 +86,7 @@ type App struct {
 	patchManager *patch.Manager
 
 	lootBypass      *loot.Bypass
+	lootSender      *loot.RequestSender
 	inputManager    *input.Manager
 	reactionManager *reaction.Manager
 	afkMonitor      *afk.Monitor
@@ -136,11 +137,19 @@ type App struct {
 	recording   bool
 	routePoints [][3]float32
 	recordMu    sync.Mutex
+
+	// Social action test ID (Shift+E fires it, Shift+R/Shift+T adjust) — used
+	// to discover the commandId for a self/untargeted emote to mask the loot
+	// animation for observers. Starts at the one confirmed-real value we have
+	// (0x5c, a targeted "greet"-style action) purely to validate the send
+	// pipeline; not the final emote ID. See memory/loot-anim-suppress.md.
+	socialTestID uint32
 }
 
 func NewApp() (*App, error) {
 	app := &App{
-		visible:   true,
+		visible:      true,
+		socialTestID: 0x5c,
 		keyStates: make(map[int]bool),
 		stopChan:  make(chan struct{}),
 	}
@@ -195,6 +204,7 @@ func NewApp() (*App, error) {
 	// Loot/Doodad bypass
 	if feat(featureLoot) {
 		app.lootBypass = loot.NewBypass(handle, x2game)
+		app.lootSender = loot.NewRequestSender(handle, x2game)
 	}
 
 	// Keyspam / Input manager
@@ -523,6 +533,91 @@ func (app *App) initRoutesWindow() {
 // Bot
 // ============================================================================
 
+// entityHasBuff lê a lista de buffs de uma entidade (pelo endereço do struct)
+// e verifica se ela possui o buff informado. Cadeia genérica por-entidade
+// (mesma usada por monitor.GetBuffListAddr, que serve pra qualquer entidade):
+//
+//	entityAddr + OFF_ENTITY_BASE (0x38) -> base
+//	base       + OFF_DEBUFF_PTR  (0x1898) -> buffList
+//	buffList   + OFF_BUFF_COUNT  (0x20) -> count
+//	buffList   + OFF_BUFF_ARRAY  (0x28) -> array (stride BUFF_SIZE, ID em +0x04)
+//
+// Usa app.handle direto (não depende do featureReactions/buffMonitor).
+func (app *App) entityHasBuff(entityAddr, buffID uint32) bool {
+	if entityAddr == 0 || buffID == 0 {
+		return false
+	}
+	buffMgr := app.entityBuffMgr(entityAddr)
+	if buffMgr == 0 {
+		return false
+	}
+	// Lista de BUFFS: count@+0x20, array@+0x28, stride BUFF_SIZE, ID@+0x04
+	if bc := memory.ReadU32(app.handle, buffMgr+uintptr(config.OFF_BUFF_COUNT)); bc > 0 && bc <= 50 {
+		arr := buffMgr + uintptr(config.OFF_BUFF_ARRAY)
+		for i := uint32(0); i < bc && i < 30; i++ {
+			off := arr + uintptr(i)*uintptr(config.BUFF_SIZE)
+			if memory.ReadU32(app.handle, off+uintptr(config.BUFF_OFF_ID)) == buffID {
+				return true
+			}
+		}
+	}
+	// Lista de DEBUFFS: count@+0xD28, array@+0xD30, stride DEBUFF_SIZE, ID@+0x00
+	if dc := memory.ReadU32(app.handle, buffMgr+uintptr(config.OFF_DEBUFF_COUNT)); dc > 0 && dc <= 50 {
+		arr := buffMgr + uintptr(config.OFF_DEBUFF_ARRAY)
+		for i := uint32(0); i < dc && i < 30; i++ {
+			off := arr + uintptr(i)*uintptr(config.DEBUFF_SIZE)
+			if memory.ReadU32(app.handle, off) == buffID { // ID do debuff em +0x00
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// entityBuffMgr resolve o BuffManager de uma entidade:
+// entityAddr + OFF_ENTITY_BASE (0x38) -> base + OFF_DEBUFF_PTR (0x1898) -> buffMgr.
+// Mesmo chain do target.Monitor.getBuffManagerAddr (o buffMgr contém as DUAS
+// listas: buffs em +0x20/+0x28 e debuffs em +0xD28/+0xD30).
+func (app *App) entityBuffMgr(entityAddr uint32) uintptr {
+	if entityAddr == 0 {
+		return 0
+	}
+	base := memory.ReadU32(app.handle, uintptr(entityAddr)+uintptr(config.OFF_ENTITY_BASE))
+	if !memory.IsValidPtr(base) {
+		return 0
+	}
+	buffMgr := memory.ReadU32(app.handle, uintptr(base)+uintptr(config.OFF_DEBUFF_PTR))
+	if !memory.IsValidPtr(buffMgr) {
+		return 0
+	}
+	return uintptr(buffMgr)
+}
+
+// entityBuffIDs é o diagnóstico do entityHasBuff: devolve os IDs de buffs E
+// debuffs da entidade. Serve pra confirmar QUAL aura (ex: 815=Untouchable) o
+// mob tem e em qual lista ela está.
+func (app *App) entityBuffIDs(entityAddr uint32) (buffs []uint32, debuffs []uint32) {
+	buffMgr := app.entityBuffMgr(entityAddr)
+	if buffMgr == 0 {
+		return nil, nil
+	}
+	if bc := memory.ReadU32(app.handle, buffMgr+uintptr(config.OFF_BUFF_COUNT)); bc > 0 && bc <= 50 {
+		arr := buffMgr + uintptr(config.OFF_BUFF_ARRAY)
+		for i := uint32(0); i < bc && i < 30; i++ {
+			off := arr + uintptr(i)*uintptr(config.BUFF_SIZE)
+			buffs = append(buffs, memory.ReadU32(app.handle, off+uintptr(config.BUFF_OFF_ID)))
+		}
+	}
+	if dc := memory.ReadU32(app.handle, buffMgr+uintptr(config.OFF_DEBUFF_COUNT)); dc > 0 && dc <= 50 {
+		arr := buffMgr + uintptr(config.OFF_DEBUFF_ARRAY)
+		for i := uint32(0); i < dc && i < 30; i++ {
+			off := arr + uintptr(i)*uintptr(config.DEBUFF_SIZE)
+			debuffs = append(debuffs, memory.ReadU32(app.handle, off))
+		}
+	}
+	return buffs, debuffs
+}
+
 func (app *App) initBot() {
 	if app.espManager == nil {
 		fmt.Println("[BOT] ESP não disponível, bot desabilitado")
@@ -581,12 +676,31 @@ func (app *App) initBot() {
 		cfg.TargetDelay = time.Duration(fc.TargetDelayMs) * time.Millisecond
 	}
 
+	// Exclusão de mobs por buff (ex: 851 = mob protegido/reivindicado) +
+	// cadência da reorganização da fila. HasBuff lê a lista de buffs por-mob.
+	cfg.ExcludeBuffID = fc.ExcludeBuffID
+	cfg.ExcludeBuffEnabled = fc.ExcludeBuffEnabled
+	if fc.QueueReorgMs > 0 {
+		cfg.QueueReorgInterval = time.Duration(fc.QueueReorgMs) * time.Millisecond
+	}
+	if fc.BuffBlacklistMs > 0 {
+		cfg.BuffBlacklistTTL = time.Duration(fc.BuffBlacklistMs) * time.Millisecond
+	}
+	cfg.HasBuff = app.entityHasBuff
+
 	cfg.OnTargetDead = func(t bot.EntityInfo) {
 		fmt.Printf("[BOT] Killed: %s → scanning next...\n", t.Name)
 	}
 
 	cfg.OnTargetAcquired = func(t bot.EntityInfo) {
-		fmt.Printf("[BOT] Attacking: %s (HP:%d Dist:%.0fm)\n", t.Name, t.HP, t.Distance)
+		// Diagnóstico da exclusão por buff: dump dos buffs do alvo recém-selecionado.
+		// Se o mob tem "Untouchable" e aqui vier count>0 com 851 na lista, a leitura
+		// pós-seleção funciona (o drop+blacklist do tickCombat cuida do resto). Se vier
+		// count=0 mesmo com o buff visível, os buffs de mob não estão no struct da
+		// entidade e precisamos achar a estrutura do alvo (x64dbg).
+		buffs, debuffs := app.entityBuffIDs(t.Address)
+		fmt.Printf("[BOT] Attacking: %s (HP:%d Dist:%.0fm) [buffs=%v debuffs=%v]\n",
+			t.Name, t.HP, t.Distance, buffs, debuffs)
 	}
 
 	cfg.OnCombatTick = func(t bot.EntityInfo) {
@@ -598,6 +712,26 @@ func (app *App) initBot() {
 	cfg.LootKey = fc.LootKey
 	cfg.AutoAttack = fc.AutoAttack
 	cfg.AutoLoot = fc.AutoLoot
+	cfg.LootViaPacket = fc.LootViaPacket
+	if app.lootSender != nil {
+		cfg.LootAll = app.lootSender.LootAll
+	}
+	// SetTargetFn: try the Tick-hook cave first (runs on the game's real main
+	// thread), but that cave is a shared resource — House ESP's CS222 sender
+	// also hooks Tick and holds it for as long as House ESP is enabled, so
+	// RequestSender.Start() fails outright while that's active (see
+	// loot/packet.go doc comment). Falling back to the direct
+	// CreateRemoteThread call (target.SetTarget) means targeting never
+	// hard-fails just because another feature owns the hook — it only loses
+	// the main-thread guarantee for that one call.
+	cfg.SetTargetFn = func(unitId uint32) error {
+		if app.lootSender != nil {
+			if err := app.lootSender.SetTarget(unitId); err == nil {
+				return nil
+			}
+		}
+		return target.SetTarget(app.handle, app.x2game, unitId)
+	}
 	if fc.AttackDelay > 0 {
 		cfg.AttackDelay = time.Duration(fc.AttackDelay) * time.Millisecond
 	}
@@ -843,6 +977,105 @@ func (app *App) startBackgroundTasks() {
 	go app.monitorLoop()
 	go app.watchdogLoop()
 	go app.moveLoop()
+	go app.lootWatchLoop()
+}
+
+// lootWatchRadius limita o lootWatchLoop a um raio de combate plausível,
+// deliberadamente menor que o range de exibição do ESP "All Entities"
+// (padrão 200m, ajustável até 500m via UI). Usar o range do ESP direto fazia
+// NPCs comuns saindo do alcance de renderização — não mortos, só longe —
+// contarem como "morte" e entrar na fila de auto-loot.
+const lootWatchRadius float32 = 40.0
+
+// lootWatchLoop detecta NPCs próximos que morreram (somem da lista de
+// entidades — a coleta em esp/all_entities.go já filtra HP<100, então "sumiu"
+// == "morreu ou saiu do raio") e, enquanto o bypass de loot (F1) estiver
+// ativo, enfileira um loot automático via pacote direto (LootMgr_RequestLoot
+// + TakeItem), sem depender do bot estar rodando nem do mob ter sido alvo
+// dele. Roda independente do bot: F1 sozinho já basta.
+func (app *App) lootWatchLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Fila pequena e limitada, drenada por um único worker: LootAll já é
+	// serializado internamente (mesmo code cave/hook que a tecla V e o bot
+	// usam), então empilhar uma goroutine por evento fazia rajadas de falsos
+	// positivos (NPCs saindo do raio) travarem em fila atrás umas das outras
+	// — cada tentativa perdida custa até ~2.5s de timeout — e "engolir" o
+	// loot de um mob que morreu de verdade. Best-effort: fila cheia descarta
+	// o evento mais novo em vez de acumular.
+	deaths := make(chan uint32, 4)
+	go app.lootWatchWorker(deaths)
+
+	seen := make(map[uint32]bool) // NPCs vivos vistos no último scan
+
+	for {
+		select {
+		case <-app.stopChan:
+			return
+		case <-ticker.C:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Printf("[ERROR] Panic in loot watch loop: %v\n", r)
+					}
+				}()
+
+				if app.lootBypass == nil || !app.lootBypass.IsLootEnabled() {
+					// Bypass desligado: zera o baseline pra não disparar loot
+					// atrasado pra mobs que já sumiram enquanto o F1 tava OFF.
+					if len(seen) > 0 {
+						seen = make(map[uint32]bool)
+					}
+					return
+				}
+				if app.espManager == nil || app.lootSender == nil {
+					return
+				}
+
+				entities := app.espManager.GetAllEntitiesCached()
+				current := make(map[uint32]bool, len(entities))
+				for _, e := range entities {
+					if !e.IsNPC || e.EntityID == 0 || e.Distance > lootWatchRadius {
+						continue
+					}
+					current[e.EntityID] = true
+				}
+
+				for id := range seen {
+					if current[id] {
+						continue
+					}
+					select {
+					case deaths <- id:
+					default:
+						// fila cheia: descarta, não vale travar o worker por isso
+					}
+				}
+				seen = current
+			}()
+		}
+	}
+}
+
+// lootWatchWorker processa mortes detectadas por lootWatchLoop uma de cada
+// vez, evitando que uma rajada de falsos positivos sature o mutex do
+// RequestSender e atrase o loot de um mob que morreu de verdade.
+func (app *App) lootWatchWorker(deaths <-chan uint32) {
+	for {
+		select {
+		case <-app.stopChan:
+			return
+		case id := <-deaths:
+			taken, err := app.lootSender.LootAll(id)
+			if err == nil && taken > 0 {
+				fmt.Printf("[LOOT] Auto-loot (F1): ID:%d -> %d itens\n", id, taken)
+			}
+			// Erros (corpo não lootável / não morreu de verdade, só saiu do
+			// raio) são esperados aqui já que não distinguimos "morreu" de
+			// "desapareceu" — silenciosos de propósito pra não floodar o log.
+		}
+	}
 }
 
 func (app *App) hotkeyLoop() {
@@ -1441,18 +1674,108 @@ func (app *App) pollHotkeys() {
 				fmt.Printf("[SWIMFLY] vtable 0x%X nao e do CActor (UpdateSwimStats nao encontrado)\n", vtable)
 				return
 			}
-			isInWater := memory.ReadU32(app.handle, uintptr(vtable)+0x68)
-			if isInWater < codeLo || isInWater > codeHi {
-				fmt.Printf("[SWIMFLY] IsInWater ptr invalido: 0x%X\n", isInWater)
+			// Forca a true os getters de agua do CActor:
+			//   +0x68 IsInWater (anima nado)  |  +0xA8 IsUnderWater (libera nado-3D/subir)
+			slots := []struct {
+				off  uintptr
+				name string
+			}{
+				{0x68, "SwimFly_IsInWater"},
+				{0xA8, "SwimFly_IsUnderWater"},
+			}
+			state := "OFF"
+			for _, s := range slots {
+				fn := memory.ReadU32(app.handle, uintptr(vtable)+s.off)
+				if fn < codeLo || fn > codeHi {
+					fmt.Printf("[SWIMFLY] %s ptr invalido: 0x%X\n", s.name, fn)
+					continue
+				}
+				on := app.patchManager.Toggle(s.name, uintptr(fn), []byte{0xB0, 0x01, 0xC3})
+				if on {
+					state = "ON"
+				}
+				fmt.Printf("[SWIMFLY] %s = 0x%X (RVA 0x%X) -> %s\n", s.name, fn, fn-0x39000000, state)
+			}
+			fmt.Printf("[PATCH] Swim-fly: %s\n", state)
+		},
+
+		// ============ LOOT VIA PACOTE (sem Lua/UI, sem bypass de distância) ============
+		0x56: func() { // V - RequestLoot + TakeItem por item no alvo selecionado
+			if app.lootSender == nil {
 				return
 			}
-			fmt.Printf("[SWIMFLY] CActor::IsInWater = 0x%X (RVA 0x%X)\n", isInWater, isInWater-0x39000000)
-			on := app.patchManager.Toggle("SwimFly_IsInWater", uintptr(isInWater), []byte{0xB0, 0x01, 0xC3})
+			// g_pCurrentSelection é ponteiro PARA o objeto de seleção (dupla
+			// indireção, confirmado em LootMgr_OnLootMenuCommand @0x39139640).
+			selObjPtr := memory.ReadU32(app.handle, app.x2game+config.OFF_CURRENT_SELECTION)
+			if selObjPtr == 0 {
+				fmt.Println("[LOOT] nenhum alvo selecionado (g_pCurrentSelection vazio)")
+				return
+			}
+			targetId := memory.ReadU32(app.handle, uintptr(selObjPtr)+4)
+			go func() {
+				taken, err := app.lootSender.LootAll(targetId)
+				if err != nil {
+					fmt.Printf("[LOOT] LootAll(target=0x%X) falhou: %v\n", targetId, err)
+					return
+				}
+				fmt.Printf("[LOOT] LootAll(target=0x%X) -> %d itens pegos\n", targetId, taken)
+			}()
+		},
+
+		// ============ SUPRIME ANIMAÇÃO DE LOOT ============
+		0x4E: func() { // Shift+N - NOPa o call que dispara a pose/gesto de loot no player local
+			if !shiftDown() {
+				return
+			}
+			if app.patchManager == nil {
+				return
+			}
+			// Packet_OnLootingBag -> LootMgr_OnLootBagOpened -> "push state; call
+			// CActor_SetLootingAnimState" no player local (state=1 pose contínua
+			// de loot, state=2 gesto "loot all"). Patch no call site (não na
+			// função) pra não mutar a animação de loot de outros players, que
+			// passa pelos outros 2 callers de CActor_SetLootingAnimState.
+			addr := app.x2game + config.OFF_LOOT_ANIM_CALL_SITE
+			on := app.patchManager.Toggle("LootAnimSuppress", addr, []byte{0x90, 0x90, 0x90, 0x90, 0x90, 0x90})
 			status := "OFF"
 			if on {
 				status = "ON"
 			}
-			fmt.Printf("[PATCH] Swim-fly (IsInWater=true): %s\n", status)
+			fmt.Printf("[PATCH] Loot animation suppress: %s\n", status)
+		},
+
+		// ============ DESCOBERTA DE EMOTE (mascarar animação de loot) ============
+		0x52: func() { // Shift+R - diminui o ID de teste
+			if !shiftDown() {
+				return
+			}
+			if app.socialTestID > 0 {
+				app.socialTestID--
+			}
+			fmt.Printf("[SOCIAL] test ID = 0x%X (%d)\n", app.socialTestID, app.socialTestID)
+		},
+		0x54: func() { // Shift+T - aumenta o ID de teste
+			if !shiftDown() {
+				return
+			}
+			app.socialTestID++
+			fmt.Printf("[SOCIAL] test ID = 0x%X (%d)\n", app.socialTestID, app.socialTestID)
+		},
+		0x45: func() { // Shift+E - dispara SendSocialActionPacket(test ID)
+			if !shiftDown() {
+				return
+			}
+			if app.lootSender == nil {
+				return
+			}
+			id := app.socialTestID
+			go func() {
+				if err := app.lootSender.PlaySocialAction(id); err != nil {
+					fmt.Printf("[SOCIAL] PlaySocialAction(0x%X) falhou: %v\n", id, err)
+					return
+				}
+				fmt.Printf("[SOCIAL] PlaySocialAction(0x%X) enviado\n", id)
+			}()
 		},
 	}
 
@@ -1869,6 +2192,9 @@ func (app *App) Close() {
 	}
 	if app.lootBypass != nil {
 		app.lootBypass.Cleanup()
+	}
+	if app.lootSender != nil {
+		app.lootSender.Stop()
 	}
 	if app.buffInjector != nil {
 		app.buffInjector.StopFreezeLoop()

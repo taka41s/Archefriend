@@ -12,27 +12,17 @@ import (
 )
 
 // ====================
-// Constants (SetTarget)
+// Constants (GetCurrentTargetId — pure memory read, no injection needed)
 // ====================
 
 const (
-	OFFSET_SET_TARGET     uintptr = 0x1BE090
 	PTR_ENEMY_TARGET_BASE uintptr = 0x19EBF4
 	OFF_TARGET_ID         uintptr = 0x08
-
-	MEM_COMMIT             = 0x1000
-	MEM_RESERVE            = 0x2000
-	MEM_RELEASE            = 0x8000
-	PAGE_EXECUTE_READWRITE = 0x40
 )
 
 var (
-	kernel32               = windows.NewLazySystemDLL("kernel32.dll")
-	procVirtualAllocEx     = kernel32.NewProc("VirtualAllocEx")
-	procVirtualFreeEx      = kernel32.NewProc("VirtualFreeEx")
-	procWriteProcessMem    = kernel32.NewProc("WriteProcessMemory")
-	procReadProcessMem     = kernel32.NewProc("ReadProcessMemory")
-	procCreateRemoteThread = kernel32.NewProc("CreateRemoteThread")
+	kernel32           = windows.NewLazySystemDLL("kernel32.dll")
+	procReadProcessMem = kernel32.NewProc("ReadProcessMemory")
 )
 
 // ====================
@@ -134,6 +124,7 @@ type Config struct {
 	LootDelay    time.Duration // delay para loot após kill
 	AutoAttack   bool          // atacar automaticamente
 	AutoLoot     bool          // lootar automaticamente
+	LootViaPacket bool         // usa loot.RequestSender (pacote direto) em vez de keyspam
 
 	// Potion settings
 	HPPotionKey       string        // tecla HP potion
@@ -152,9 +143,40 @@ type Config struct {
 	// Key sender (injetado pelo main)
 	SendKey func(key string)
 
+	// LootAll chama LootMgr_RequestLoot + LootMgr_TakeItem por item, direto
+	// (injetado pelo main via loot.RequestSender.LootAll), usado quando
+	// LootViaPacket=true em vez de keyspam. Retorna quantos itens pegou.
+	LootAll func(targetId uint32) (int, error)
+
+	// SetTargetFn chama X2::GameClient::SetTarget(unitId). Injetado pelo main:
+	// tenta primeiro via Tick-hook (loot.RequestSender.SetTarget, roda na
+	// thread principal do jogo) e cai para o CreateRemoteThread antigo
+	// (target.SetTarget) só se o hook de Tick estiver ocupado por outra
+	// feature (ex: House ESP CS222) — ver main.go.
+	SetTargetFn func(unitId uint32) error
+
 	// Player stats provider (injetado pelo main)
 	GetPlayerHP func() (current, max uint32) // retorna HP atual e máximo
 	GetPlayerMP func() (current, max uint32) // retorna MP atual e máximo
+
+	// Exclusão por buff: mobs que possuem ExcludeBuffID são removidos da fila
+	// (nunca alvejados enquanto tiverem o buff). Ex: buff 851 = mob
+	// protegido/reivindicado. A verificação de proximidade continua sendo a
+	// prioridade primária entre os mobs restantes (mais perto primeiro).
+	ExcludeBuffID      uint32        // buff que exclui o mob da fila (0 = desativado)
+	ExcludeBuffEnabled bool          // liga/desliga a exclusão por buff
+	QueueReorgInterval time.Duration // cadência da reorganização da fila (ex: 50ms)
+
+	// BuffBlacklistTTL: quando o alvo é largado por ter o buff de exclusão
+	// (detectado APÓS selecionar, já que muitos clientes só sincronizam os
+	// buffs do alvo selecionado), o EntityID entra numa blacklist por esse
+	// tempo pra não ser re-selecionado em loop. 0 = usa 15s.
+	BuffBlacklistTTL time.Duration
+
+	// HasBuff verifica se a entidade (pelo Address do struct) possui o buff dado.
+	// Injetado pelo main: lê a cadeia entityAddr+0x38 -> +0x1898 -> buff array.
+	// Nil desativa a exclusão por buff (degrada graciosamente).
+	HasBuff func(entityAddr uint32, buffID uint32) bool
 }
 
 func DefaultConfig() Config {
@@ -170,6 +192,7 @@ func DefaultConfig() Config {
 		LootDelay:    300 * time.Millisecond,
 		AutoAttack:   true,
 		AutoLoot:     true,
+		LootViaPacket: false,
 		// Potion defaults
 		HPPotionKey:       "5",
 		HPPotionThreshold: 50.0,
@@ -178,6 +201,11 @@ func DefaultConfig() Config {
 		MPPotionThreshold: 30.0,
 		MPPotionEnabled:   false,
 		PotionCooldown:    21 * time.Second,
+		// Exclusão por buff (default: 851 ligado, reorg da fila a 50ms)
+		ExcludeBuffID:      851,
+		ExcludeBuffEnabled: true,
+		QueueReorgInterval: 50 * time.Millisecond,
+		BuffBlacklistTTL:   15 * time.Second,
 	}
 }
 
@@ -208,10 +236,13 @@ type Bot struct {
 	currentTarget   *EntityInfo
 	killQueue       map[uint32]EntityInfo // Dados dos mobs (lookup rápido)
 	killQueueOrder  []uint32              // Ordem FIFO (primeiro a entrar, primeiro a sair)
+	buffBlacklist   map[uint32]time.Time  // EntityID -> expiry (mobs largados por buff de exclusão)
+	targetAttempts  map[uint32]int        // EntityID -> falhas consecutivas de seleção (anti-loop)
 	stats           Stats
 	stopChan        chan struct{}
 	lastAttackTime  time.Time
 	lastLootTime    time.Time
+	lastReorgTime   time.Time // última reorganização da fila (throttle QueueReorgInterval)
 
 	// Potion cooldown tracking
 	lastHPPotionTime time.Time
@@ -235,6 +266,8 @@ func New(handle windows.Handle, x2game uintptr, provider EntityProvider, cfg Con
 		provider:       provider,
 		killQueue:      make(map[uint32]EntityInfo),
 		killQueueOrder: make([]uint32, 0),
+		buffBlacklist:  make(map[uint32]time.Time),
+		targetAttempts: make(map[uint32]int),
 		stopChan:       make(chan struct{}),
 	}
 }
@@ -256,6 +289,8 @@ func (b *Bot) Start() {
 	// Limpa a kill queue ao reiniciar
 	b.killQueue = make(map[uint32]EntityInfo)
 	b.killQueueOrder = make([]uint32, 0)
+	b.buffBlacklist = make(map[uint32]time.Time)
+	b.targetAttempts = make(map[uint32]int)
 	b.currentTarget = nil
 	b.mu.Unlock()
 
@@ -387,6 +422,13 @@ func (b *Bot) SetAutoLoot(enabled bool) {
 	b.config.AutoLoot = enabled
 }
 
+func (b *Bot) SetLootViaPacket(enabled bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config.LootViaPacket = enabled
+	fmt.Printf("[BOT] Loot via pacote: %v\n", enabled)
+}
+
 func (b *Bot) SetAttackDelay(ms int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -434,6 +476,41 @@ func (b *Bot) SetPotionCooldown(ms int) {
 	fmt.Printf("[BOT] Potion cooldown: %dms\n", ms)
 }
 
+// SetExcludeBuff configura a exclusão de mobs por buff (ex: 851).
+func (b *Bot) SetExcludeBuff(buffID uint32, enabled bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config.ExcludeBuffID = buffID
+	b.config.ExcludeBuffEnabled = enabled
+	fmt.Printf("[BOT] Exclusão por buff: id=%d enabled=%v\n", buffID, enabled)
+}
+
+// SetQueueReorgInterval define a cadência da reorganização da fila (ms).
+func (b *Bot) SetQueueReorgInterval(ms int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ms > 0 {
+		b.config.QueueReorgInterval = time.Duration(ms) * time.Millisecond
+	}
+}
+
+// SetHasBuffFn injeta o leitor de buff por-entidade (usado pela exclusão 851).
+func (b *Bot) SetHasBuffFn(fn func(entityAddr uint32, buffID uint32) bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.config.HasBuff = fn
+}
+
+// SetBuffBlacklistTTL define por quanto tempo (ms) um mob largado por buff fica
+// na blacklist antes de poder ser re-selecionado.
+func (b *Bot) SetBuffBlacklistTTL(ms int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ms > 0 {
+		b.config.BuffBlacklistTTL = time.Duration(ms) * time.Millisecond
+	}
+}
+
 func (b *Bot) SetPlayerHPProvider(fn func() (uint32, uint32)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -459,8 +536,22 @@ func (b *Bot) GetConfig() Config {
 // UpdateKillQueue atualiza a fila de mobs para matar com base nas entidades atuais.
 // Ordena por distância: o mob mais perto é sempre o primeiro da fila.
 func (b *Bot) UpdateKillQueue(entities []EntityInfo, maxRange float32, mobNames []string, partial bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	// Snapshot da config de exclusão por buff. As leituras de memória do HasBuff
+	// são feitas ANTES de segurar b.mu, pra não prender o lock durante os RPM.
+	b.mu.RLock()
+	excludeEnabled := b.config.ExcludeBuffEnabled
+	excludeBuffID := b.config.ExcludeBuffID
+	hasBuff := b.config.HasBuff
+	// Snapshot da blacklist temporária (mobs largados por terem o buff de
+	// exclusão, detectado pós-seleção). Só os ainda não expirados.
+	now := time.Now()
+	blacklisted := make(map[uint32]bool, len(b.buffBlacklist))
+	for id, exp := range b.buffBlacklist {
+		if now.Before(exp) {
+			blacklisted[id] = true
+		}
+	}
+	b.mu.RUnlock()
 
 	// Cria set de IDs atuais válidos
 	currentValid := make(map[uint32]EntityInfo)
@@ -471,7 +562,28 @@ func (b *Bot) UpdateKillQueue(entities []EntityInfo, maxRange float32, mobNames 
 		if !matchName(e.Name, mobNames, partial) {
 			continue
 		}
+		// Blacklist temporário: mob largado recentemente por ter o buff.
+		if blacklisted[e.EntityID] {
+			continue
+		}
+		// Exclusão total (pré-seleção): funciona SE o cliente expõe os buffs de
+		// mobs não-alvo. Caso contrário, a rede de segurança é o drop+blacklist
+		// pós-seleção em tickCombat.
+		if excludeEnabled && excludeBuffID != 0 && hasBuff != nil && e.Address != 0 &&
+			hasBuff(e.Address, excludeBuffID) {
+			continue
+		}
 		currentValid[e.EntityID] = e
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Purga entradas expiradas da blacklist
+	for id, exp := range b.buffBlacklist {
+		if !now.Before(exp) {
+			delete(b.buffBlacklist, id)
+		}
 	}
 
 	// Remove mobs que não são mais válidos (mortos, fora de range, etc)
@@ -532,6 +644,24 @@ func (b *Bot) removeFromQueueWithReason(entityID uint32, reason string) {
 			}
 		}
 	}
+}
+
+// BlacklistMob coloca um EntityID na blacklist temporária por ttl (ou o
+// BuffBlacklistTTL configurado se ttl<=0). Enquanto ativo, o mob é ignorado
+// pela fila. Usado quando o alvo é largado por ter o buff de exclusão.
+func (b *Bot) BlacklistMob(entityID uint32, ttl time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ttl <= 0 {
+		ttl = b.config.BuffBlacklistTTL
+	}
+	if ttl <= 0 {
+		ttl = 15 * time.Second
+	}
+	if b.buffBlacklist == nil {
+		b.buffBlacklist = make(map[uint32]time.Time)
+	}
+	b.buffBlacklist[entityID] = time.Now().Add(ttl)
 }
 
 // GetKillQueue retorna uma cópia da fila de mobs na ordem FIFO.
@@ -600,6 +730,11 @@ func (b *Bot) loop() {
 func (b *Bot) tick() {
 	// Always check potions regardless of state
 	b.tickPotions()
+
+	// Reorganiza a fila de forma independente do estado, na cadência
+	// QueueReorgInterval (ex: 50ms): aplica exclusão por buff (851) +
+	// prioridade de proximidade. Assim a fila continua correta mesmo em combate.
+	b.maybeReorgQueue()
 
 	b.mu.RLock()
 	state := b.state
@@ -675,68 +810,79 @@ func (b *Bot) tickPotions() {
 	}
 }
 
-func (b *Bot) tickIdle() {
+// maybeReorgQueue reorganiza a kill queue na cadência QueueReorgInterval,
+// independente do estado do bot. É o ÚNICO ponto que chama UpdateKillQueue,
+// então a exclusão por buff (851) e a ordenação por proximidade acontecem numa
+// taxa controlada (~50ms), sem martelar os RPM de leitura de buff a cada tick.
+func (b *Bot) maybeReorgQueue() {
+	b.mu.RLock()
+	interval := b.config.QueueReorgInterval
+	last := b.lastReorgTime
+	mobNames := b.config.MobNames
+	partial := b.config.PartialMatch
+	b.mu.RUnlock()
+
+	if interval <= 0 {
+		interval = 50 * time.Millisecond
+	}
+	if time.Since(last) < interval {
+		return
+	}
+	if len(mobNames) == 0 {
+		return
+	}
+
 	entities := b.provider.GetEntities()
 	if len(entities) == 0 {
 		return
 	}
 
-	// Use dynamic range from ESP if available
 	maxRange := b.getEffectiveRange()
+	b.UpdateKillQueue(entities, maxRange, mobNames, partial)
 
+	b.mu.Lock()
+	b.lastReorgTime = time.Now()
+	b.mu.Unlock()
+}
+
+// frontOfQueue retorna uma cópia do melhor alvo da fila (primeiro válido com
+// HP > 0). Como a fila já está ordenada por proximidade e sem os mobs
+// excluídos por buff, o primeiro elemento é o mob mais perto "limpo".
+func (b *Bot) frontOfQueue() *EntityInfo {
 	b.mu.RLock()
-	mobNames := b.config.MobNames
-	partial := b.config.PartialMatch
-	b.mu.RUnlock()
+	defer b.mu.RUnlock()
+	for _, id := range b.killQueueOrder {
+		if e, ok := b.killQueue[id]; ok && e.HP > 0 {
+			cpy := e
+			return &cpy
+		}
+	}
+	return nil
+}
 
-	if len(mobNames) == 0 {
+func (b *Bot) tickIdle() {
+	// A fila é reorganizada por maybeReorgQueue (throttle QueueReorgInterval),
+	// já com exclusão por buff + ordenação por proximidade. Aqui só pegamos
+	// o melhor alvo da frente da fila.
+	closest := b.frontOfQueue()
+	if closest == nil {
 		return
 	}
 
-	// Atualiza kill queue com mobs válidos na range
-	b.UpdateKillQueue(entities, maxRange, mobNames, partial)
-
-	// Cria lookup rápido das entidades atuais (para validar se mob ainda existe)
-	currentEntities := make(map[uint32]EntityInfo)
-	for _, e := range entities {
-		currentEntities[e.EntityID] = e
-	}
-
-	// Pega o mob mais perto da queue que ainda existe e tem HP > 0
 	b.mu.Lock()
-	var closest *EntityInfo
-	var closestDist float32
-
-	for _, id := range b.killQueueOrder {
-		if _, ok := b.killQueue[id]; ok {
-			currentEntity, exists := currentEntities[id]
-			if !exists || currentEntity.HP == 0 {
-				continue
-			}
-			if closest == nil || currentEntity.Distance < closestDist {
-				cpy := currentEntity
-				closest = &cpy
-				closestDist = currentEntity.Distance
-			}
-		}
-	}
+	b.currentTarget = closest
+	b.state = StateTargeting
 	b.mu.Unlock()
 
-	if closest != nil {
-		b.mu.Lock()
-		b.currentTarget = closest
-		b.state = StateTargeting
-		b.mu.Unlock()
-
-		queueCount := b.GetKillQueueCount()
-		fmt.Printf("[BOT] Target: %s (ID:%d HP:%d Dist:%.0fm) [Queue: %d]\n",
-			closest.Name, closest.EntityID, closest.HP, closest.Distance, queueCount)
-	}
+	queueCount := b.GetKillQueueCount()
+	fmt.Printf("[BOT] Target: %s (ID:%d HP:%d Dist:%.0fm) [Queue: %d]\n",
+		closest.Name, closest.EntityID, closest.HP, closest.Distance, queueCount)
 }
 
 func (b *Bot) tickTargeting() {
 	b.mu.RLock()
 	target := b.currentTarget
+	setTargetFn := b.config.SetTargetFn
 	b.mu.RUnlock()
 
 	if target == nil {
@@ -744,9 +890,19 @@ func (b *Bot) tickTargeting() {
 		return
 	}
 
-	if err := b.setTarget(target.EntityID); err != nil {
+	if setTargetFn == nil {
+		fmt.Printf("[BOT] SetTargetFn não configurado\n")
+		b.clearTarget()
+		return
+	}
+
+	if err := setTargetFn(target.EntityID); err != nil {
 		fmt.Printf("[BOT] SetTarget failed: %v\n", err)
-		// Não remove da queue aqui - deixa UpdateKillQueue validar o estado
+		// Não remove da queue aqui - deixa UpdateKillQueue validar o estado.
+		// Espera antes de liberar pro próximo retry (evita martelar o
+		// injector a cada ScanInterval quando a chamada está falhando).
+		b.noteTargetFailure(target.EntityID, "SetTarget erro")
+		time.Sleep(b.config.TargetDelay)
 		b.clearTarget()
 		return
 	}
@@ -755,8 +911,34 @@ func (b *Bot) tickTargeting() {
 
 	// Confirma que pegou
 	if b.getCurrentTargetId() != target.EntityID {
-		fmt.Printf("[BOT] Target mismatch - tentando novamente\n")
-		// Não remove da queue - pode ser lag do client, tenta de novo
+		// Não fica preso: se o mesmo mob falha repetidas vezes (ex: Untouchable
+		// que o client recusa selecionar), ele é blacklistado e a fila segue
+		// pro próximo em vez de esperar o buff cair.
+		if !b.noteTargetFailure(target.EntityID, "mismatch") {
+			fmt.Printf("[BOT] Target mismatch - tentando novamente\n")
+		}
+		time.Sleep(b.config.TargetDelay)
+		b.clearTarget()
+		return
+	}
+
+	// Selecionou com sucesso: zera o contador de falhas desse mob.
+	b.clearTargetAttempts(target.EntityID)
+
+	// Antes de entrar em combate: se o alvo tem a aura de exclusão (ex:
+	// 815/Untouchable — buff OU debuff), pula pro próximo SEM gastar ataque.
+	b.mu.RLock()
+	excludeEnabled := b.config.ExcludeBuffEnabled
+	excludeBuffID := b.config.ExcludeBuffID
+	hasBuff := b.config.HasBuff
+	tgtAddr := target.Address
+	b.mu.RUnlock()
+	if excludeEnabled && excludeBuffID != 0 && hasBuff != nil && tgtAddr != 0 &&
+		hasBuff(tgtAddr, excludeBuffID) {
+		fmt.Printf("[BOT] Alvo com aura %d (Untouchable) - pulando p/ próximo: %s (ID:%d)\n",
+			excludeBuffID, target.Name, target.EntityID)
+		b.BlacklistMob(target.EntityID, 0)
+		b.RemoveFromKillQueue(target.EntityID)
 		b.clearTarget()
 		return
 	}
@@ -773,6 +955,42 @@ func (b *Bot) tickTargeting() {
 	if b.config.OnTargetAcquired != nil {
 		b.config.OnTargetAcquired(*target)
 	}
+}
+
+// maxTargetAttempts: falhas consecutivas de seleção do MESMO mob antes de
+// blacklistá-lo e pular. Alto o bastante pra tolerar latência normal do
+// SetTarget (que resolve em 1-3 tentativas), baixo o bastante pra não travar.
+const maxTargetAttempts = 5
+
+// noteTargetFailure incrementa o contador de falhas de seleção do mob. Se
+// passar do limite, blacklista + remove da fila e devolve true (pular).
+func (b *Bot) noteTargetFailure(entityID uint32, reason string) bool {
+	b.mu.Lock()
+	if b.targetAttempts == nil {
+		b.targetAttempts = make(map[uint32]int)
+	}
+	b.targetAttempts[entityID]++
+	n := b.targetAttempts[entityID]
+	b.mu.Unlock()
+
+	if n >= maxTargetAttempts {
+		fmt.Printf("[BOT] Não consegui selecionar ID:%d após %d tentativas (%s) - blacklist + próximo\n",
+			entityID, n, reason)
+		b.BlacklistMob(entityID, 0)
+		b.RemoveFromKillQueue(entityID)
+		b.mu.Lock()
+		delete(b.targetAttempts, entityID)
+		b.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+// clearTargetAttempts zera o contador de falhas de um mob (após seleção OK).
+func (b *Bot) clearTargetAttempts(entityID uint32) {
+	b.mu.Lock()
+	delete(b.targetAttempts, entityID)
+	b.mu.Unlock()
 }
 
 func (b *Bot) tickCombat() {
@@ -819,6 +1037,24 @@ func (b *Bot) tickCombat() {
 	if !alive {
 		fmt.Printf("[BOT] Dead: %s\n", target.Name)
 		b.onMobDead(*target)
+		return
+	}
+
+	// Se o alvo atual ganhou o buff de exclusão (ex: 851) durante o combate,
+	// abandona — consistente com a exclusão total da fila.
+	b.mu.RLock()
+	excludeEnabled := b.config.ExcludeBuffEnabled
+	excludeBuffID := b.config.ExcludeBuffID
+	hasBuff := b.config.HasBuff
+	tgtAddr := target.Address
+	b.mu.RUnlock()
+	if excludeEnabled && excludeBuffID != 0 && hasBuff != nil && tgtAddr != 0 &&
+		hasBuff(tgtAddr, excludeBuffID) {
+		fmt.Printf("[BOT] Target com buff %d (Untouchable) - largando + blacklist: %s (ID:%d)\n",
+			excludeBuffID, target.Name, target.EntityID)
+		b.BlacklistMob(target.EntityID, 0)
+		b.RemoveFromKillQueue(target.EntityID)
+		b.clearTarget()
 		return
 	}
 
@@ -869,6 +1105,8 @@ func (b *Bot) onMobDead(target EntityInfo) {
 	lootKey := b.config.LootKey
 	lootDelay := b.config.LootDelay
 	sendKey := b.config.SendKey
+	lootViaPacket := b.config.LootViaPacket
+	lootAll := b.config.LootAll
 	b.mu.RUnlock()
 
 	// Remove da kill queue
@@ -883,8 +1121,24 @@ func (b *Bot) onMobDead(target EntityInfo) {
 	queueCount := b.GetKillQueueCount()
 	fmt.Printf("[BOT] Killed: %s [Queue remaining: %d]\n", target.Name, queueCount)
 
-	// Auto-loot: pressiona tecla de loot após delay (keyspam)
-	if autoLoot && sendKey != nil && lootKey != "" {
+	// Auto-loot via pacote: chama LootMgr_RequestLoot + TakeItem direto no
+	// EntityID que acabou de morrer, sem keyspam nem UI/Lua.
+	if autoLoot && lootViaPacket && lootAll != nil && target.EntityID != 0 {
+		go func() {
+			time.Sleep(lootDelay)
+			taken, err := lootAll(target.EntityID)
+			if err != nil {
+				fmt.Printf("[BOT] Loot via pacote falhou (%s): %v\n", target.Name, err)
+			} else {
+				fmt.Printf("[BOT] Loot via pacote: %s (%d itens)\n", target.Name, taken)
+			}
+			b.lastLootTime = time.Now()
+
+			time.Sleep(200 * time.Millisecond)
+			b.setState(StateIdle)
+		}()
+	} else if autoLoot && sendKey != nil && lootKey != "" {
+		// Auto-loot: pressiona tecla de loot após delay (keyspam)
 		go func() {
 			time.Sleep(lootDelay)
 			sendKeySpam(sendKey, lootKey)
@@ -904,45 +1158,6 @@ func (b *Bot) onMobDead(target EntityInfo) {
 	}
 }
 
-// ====================
-// SetTarget (shellcode)
-// ====================
-
-func (b *Bot) setTarget(unitId uint32) error {
-	addr := b.x2game + OFFSET_SET_TARGET
-
-	shellcode := []byte{
-		0x6A, 0x00,                   // push 0 (flag)
-		0x68, 0x00, 0x00, 0x00, 0x00, // push unitId
-		0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, addr
-		0xFF, 0xD0,                   // call eax
-		0x83, 0xC4, 0x08,             // add esp, 8
-		0xC3,                         // ret
-	}
-
-	*(*uint32)(unsafe.Pointer(&shellcode[3])) = unitId
-	*(*uint32)(unsafe.Pointer(&shellcode[8])) = uint32(addr)
-
-	alloc, err := virtualAllocEx(b.handle, 256)
-	if err != nil {
-		return err
-	}
-	defer virtualFreeEx(b.handle, alloc)
-
-	if err := writeProcessMemory(b.handle, alloc, shellcode); err != nil {
-		return err
-	}
-
-	th, err := createRemoteThread(b.handle, alloc)
-	if err != nil {
-		return err
-	}
-	defer windows.CloseHandle(th)
-
-	windows.WaitForSingleObject(th, 5000)
-	return nil
-}
-
 func (b *Bot) getCurrentTargetId() uint32 {
 	ptr := readU32(b.handle, b.x2game+PTR_ENEMY_TARGET_BASE)
 	if ptr == 0 {
@@ -960,35 +1175,6 @@ func readU32(handle windows.Handle, addr uintptr) uint32 {
 	var n uintptr
 	procReadProcessMem.Call(uintptr(handle), addr, uintptr(unsafe.Pointer(&val)), 4, uintptr(unsafe.Pointer(&n)))
 	return val
-}
-
-func virtualAllocEx(handle windows.Handle, size uint32) (uintptr, error) {
-	r, _, err := procVirtualAllocEx.Call(uintptr(handle), 0, uintptr(size), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE)
-	if r == 0 {
-		return 0, err
-	}
-	return r, nil
-}
-
-func virtualFreeEx(handle windows.Handle, addr uintptr) {
-	procVirtualFreeEx.Call(uintptr(handle), addr, 0, MEM_RELEASE)
-}
-
-func writeProcessMemory(handle windows.Handle, addr uintptr, data []byte) error {
-	var n uintptr
-	r, _, err := procWriteProcessMem.Call(uintptr(handle), addr, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), uintptr(unsafe.Pointer(&n)))
-	if r == 0 {
-		return err
-	}
-	return nil
-}
-
-func createRemoteThread(handle windows.Handle, addr uintptr) (windows.Handle, error) {
-	r, _, err := procCreateRemoteThread.Call(uintptr(handle), 0, 0, addr, 0, 0, 0)
-	if r == 0 {
-		return 0, err
-	}
-	return windows.Handle(r), nil
 }
 
 // ====================

@@ -141,8 +141,15 @@ const (
 	// Current target ID (0 = no target, != 0 = target selected)
 	targetIDOffset = 0x008
 
-	// Target pointer (to check if target is selected)
+	// Target pointer (to check if target is selected) — NOT confirmed to clear
+	// to 0 on deselect, kept only for legacy readers. See OFF_CURRENT_SELECTION.
 	PTR_ENEMY_TARGET uintptr = 0x19EBF4
+
+	// g_pCurrentSelection: pointer TO the selection object (double indirection).
+	// Confirmed authoritative "is something selected" signal — decompiled from
+	// LootMgr_OnLootMenuCommand @0x39139640, same global main.go's loot hotkey (V)
+	// already reads successfully. Goes to 0 immediately on deselect.
+	OFF_CURRENT_SELECTION uintptr = 0x175E830
 
 	INPUT_X_OFFSET  = 0x100
 	INPUT_Y_OFFSET  = 0x104
@@ -668,16 +675,21 @@ func (m *Manager) WorldToScreen(x, y, z float32) (float32, float32, float32) {
 	return screenX, screenY, screenZ
 }
 
-// HasTarget checks if a target is selected
+// HasTarget checks if a target is selected — reads g_pCurrentSelection
+// (OFF_CURRENT_SELECTION), which is proven to clear to 0 on deselect.
 func (m *Manager) HasTarget() bool {
-	targetPtr := m.readU32(m.x2game + PTR_ENEMY_TARGET)
-	return targetPtr != 0
+	selObjPtr := m.readU32(m.x2game + OFF_CURRENT_SELECTION)
+	return selObjPtr != 0
 }
 
 // GetTarget returns current target position (player targets only)
 func (m *Manager) GetTarget() (float32, float32, float32, bool) {
 	// Check if has target using ID
 	if !m.HasTargetByID() {
+		// Deselected — clear cached screen position so nothing keeps
+		// rendering/aiming at the last known spot.
+		m.lastTargetX = 0
+		m.lastTargetY = 0
 		return 0, 0, 0, false
 	}
 
@@ -717,6 +729,13 @@ func (m *Manager) DebugTargetInfo() {
 
 // HasTargetByID checks if has target using ID
 func (m *Manager) HasTargetByID() bool {
+	// HasTarget() reads g_pCurrentSelection, which reliably goes to 0 on deselect.
+	// The ID byte at the fixed targetBase address can lag/stay stale after deselecting
+	// a target, which kept the aimbot/ESP locked onto the last selected target. Gate
+	// on g_pCurrentSelection first so state actually clears.
+	if !m.HasTarget() {
+		return false
+	}
 	targetID := m.readU32(targetBase + targetIDOffset)
 	return targetID != 0
 }
@@ -1894,15 +1913,17 @@ func (m *Manager) AimAtTarget() bool {
 
 // AimAtTargetDebug moves cursor with optional debug
 func (m *Manager) AimAtTargetDebug(debug bool) bool {
-	targetID := m.readU32(targetBase + targetIDOffset)
-
-	// Check if target is selected
-	if targetID == 0 {
+	// Gate on HasTargetByID(), which now cross-checks the dynamic enemy-target
+	// pointer, so aiming stops immediately once the target is deselected instead
+	// of tracking a stale ID left over at the fixed targetBase address.
+	if !m.HasTargetByID() {
 		if debug {
-			fmt.Println("[AIM] FAIL: No target (ID=0)")
+			fmt.Println("[AIM] FAIL: No target selected")
 		}
 		return false
 	}
+
+	targetID := m.readU32(targetBase + targetIDOffset)
 
 	// Get player target coordinates
 	targetX := m.readFloat32(targetBase + playerTargetPosX)

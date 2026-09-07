@@ -7,12 +7,13 @@
   "partial_match": false,
   "scan_interval_ms": 20,
   "target_delay_ms": 50,
-  "attack_key": "E+3+4",
-  "loot_key": "SHIFT+F",
+  "attack_key": "E",
+  "loot_key": "",
   "attack_delay": 500,
   "loot_delay": 300,
-  "auto_attack": false,
+  "auto_attack": true,
   "auto_loot": false,
+  "loot_via_packet": false,
   "hp_potion_key": "F1",
   "hp_potion_threshold": 99,
   "hp_potion_enabled": false,
@@ -20,6 +21,10 @@
   "mp_potion_threshold": 99,
   "mp_potion_enabled": false,
   "potion_cooldown_ms": 21000,
+  "exclude_buff_id": 815,
+  "exclude_buff_enabled": true,
+  "queue_reorg_ms": 50,
+  "buff_blacklist_ms": 15000,
   "presets": {
     "preset1": [
       "Bluescale Archerfish"
